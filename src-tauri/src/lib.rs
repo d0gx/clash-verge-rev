@@ -157,6 +157,8 @@ mod app_init {
             cmd::reinstall_service,
             cmd::repair_service,
             cmd::is_service_available,
+            cmd::list_windows_ics_connections,
+            cmd::repair_windows_ics,
             cmd::get_clash_info,
             cmd::patch_clash_config,
             cmd::patch_clash_mode,

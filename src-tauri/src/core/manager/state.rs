@@ -170,6 +170,7 @@ impl CoreManager {
                 match service::run_core_by_service(&config_file).await {
                     Ok(()) => {
                         self.set_running_mode(RunningMode::Service);
+                        service::schedule_windows_ics_recovery("core-started");
                         return Ok(());
                     }
                     Err(e) => {

@@ -145,7 +145,11 @@ impl CoreManager {
 
     #[cfg(target_os = "windows")]
     async fn wait_for_service_if_needed(&self) {
-        use crate::{config::Config, constants::timing, core::service};
+        use crate::{
+            config::Config,
+            constants::timing,
+            core::{service, tray::Tray},
+        };
         use backon::{ConstantBuilder, Retryable as _};
 
         let tun_enabled = Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false);
@@ -190,6 +194,29 @@ impl CoreManager {
         })
         .retry(backoff)
         .await;
+
+        let service_ready = matches!(SERVICE_MANAGER.current().await, ServiceStatus::Ready);
+        let tun_enabled = Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false);
+        let is_admin = is_current_app_handle_admin(Handle::app_handle());
+        if should_wait_for_service(tun_enabled, service_ready, is_admin) {
+            // A non-elevated sidecar cannot create the TUN adapter. Preserve
+            // the slow-service startup window, but once it expires disable TUN
+            // before generating/spawning the sidecar configuration so the core
+            // remains usable instead of exiting immediately.
+            logging!(
+                warn,
+                Type::Core,
+                "service did not become ready in time; disabling TUN before sidecar fallback"
+            );
+            let verge = Config::verge().await;
+            verge.edit_draft(|draft| draft.enable_tun_mode = Some(false));
+            verge.apply();
+            let verge_data = verge.latest_arc();
+            if let Err(error) = verge_data.save_file().await {
+                logging!(error, Type::Core, "failed to persist TUN fallback: {error}");
+            }
+            let _ = Tray::global().update_menu().await;
+        }
     }
 
     /// 在窗口内等待服务就绪,再从 sidecar 交接到 service

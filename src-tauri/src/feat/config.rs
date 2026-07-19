@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use crate::core::service;
 use crate::{
     config::{Config, IVerge},
     core::{CoreManager, autostart, handle, hotkey, logger::Logger, sysopt, tray},
@@ -36,6 +38,10 @@ pub async fn patch_clash(patch: &Mapping) -> Result<()> {
             // 分离数据获取和异步调用
             let clash_data = Config::clash().await.data_arc();
             clash_data.save_config().await?;
+            #[cfg(target_os = "windows")]
+            if patch.get("tun").is_some() && Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false) {
+                service::schedule_windows_ics_recovery("tun-config-changed");
+            }
             Ok(())
         }
         Err(err) => {
@@ -288,6 +294,14 @@ pub async fn patch_verge(patch: &IVerge, not_save_file: bool) -> Result<()> {
         let verge_data = Config::verge().await.data_arc();
         logging!(debug, Type::Setup, "Saving Verge configuration to file...");
         verge_data.save_file().await?;
+    }
+    #[cfg(target_os = "windows")]
+    if patch.enable_tun_mode == Some(true)
+        || patch.enable_windows_ics_recovery == Some(true)
+        || patch.windows_ics_private_adapter_guid.is_some()
+        || patch.windows_ics_private_adapter_name.is_some()
+    {
+        service::schedule_windows_ics_recovery("verge-config-changed");
     }
     Ok(())
 }

@@ -85,6 +85,15 @@ pub struct IVerge {
     /// clash tun mode
     pub enable_tun_mode: Option<bool>,
 
+    /// automatically restore Windows Internet Connection Sharing for the TUN adapter
+    pub enable_windows_ics_recovery: Option<bool>,
+
+    /// stable Windows connection identifier selected as the private ICS adapter
+    pub windows_ics_private_adapter_guid: Option<String>,
+
+    /// cached display name for the selected private ICS adapter
+    pub windows_ics_private_adapter_name: Option<String>,
+
     /// can the app auto startup
     pub enable_auto_launch: Option<bool>,
 
@@ -403,6 +412,7 @@ impl IVerge {
             common_tray_icon: Some(false),
             sysproxy_tray_icon: Some(false),
             tun_tray_icon: Some(false),
+            enable_windows_ics_recovery: Some(false),
             enable_auto_launch: Some(false),
             enable_silent_start: Some(false),
             enable_hover_jump_navigator: Some(true),
@@ -495,6 +505,9 @@ impl IVerge {
         patch!(tun_tray_icon);
 
         patch!(enable_tun_mode);
+        patch!(enable_windows_ics_recovery);
+        patch!(windows_ics_private_adapter_guid);
+        patch!(windows_ics_private_adapter_name);
         patch!(enable_auto_launch);
         patch!(enable_silent_start);
         patch!(enable_hover_jump_navigator);
@@ -575,5 +588,42 @@ impl IVerge {
         } else {
             LevelFilter::Info
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IVerge;
+
+    #[test]
+    fn windows_ics_config_defaults_off_and_round_trips() -> anyhow::Result<()> {
+        let template = IVerge::template();
+        assert_eq!(template.enable_windows_ics_recovery, Some(false));
+
+        let mut config = IVerge::default();
+        config.patch_config(&IVerge {
+            enable_windows_ics_recovery: Some(true),
+            windows_ics_private_adapter_guid: Some("{private-guid}".into()),
+            windows_ics_private_adapter_name: Some("vEthernet (Private)".into()),
+            ..IVerge::default()
+        });
+
+        let yaml = serde_yaml_ng::to_string(&config)?;
+        let restored: IVerge = serde_yaml_ng::from_str(&yaml)?;
+        assert_eq!(restored.enable_windows_ics_recovery, Some(true));
+        assert_eq!(
+            restored.windows_ics_private_adapter_guid.as_deref(),
+            Some("{private-guid}")
+        );
+        assert_eq!(
+            restored.windows_ics_private_adapter_name.as_deref(),
+            Some("vEthernet (Private)")
+        );
+
+        let legacy: IVerge = serde_yaml_ng::from_str("enable_tun_mode: true\n")?;
+        assert_eq!(legacy.enable_windows_ics_recovery, None);
+        assert_eq!(legacy.windows_ics_private_adapter_guid, None);
+        assert_eq!(legacy.windows_ics_private_adapter_name, None);
+        Ok(())
     }
 }

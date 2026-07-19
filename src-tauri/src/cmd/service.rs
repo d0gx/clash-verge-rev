@@ -33,3 +33,15 @@ pub async fn is_service_available() -> CmdResult<bool> {
     service::is_service_available().await.stringify_err()?;
     Ok(true)
 }
+
+#[tauri::command]
+pub async fn list_windows_ics_connections() -> CmdResult<Vec<clash_verge_service_ipc::WindowsIcsConnection>> {
+    SERVICE_MANAGER.list_windows_ics_connections().await.stringify_err()
+}
+
+#[tauri::command]
+pub async fn repair_windows_ics(
+    request: clash_verge_service_ipc::WindowsIcsRepairRequest,
+) -> CmdResult<clash_verge_service_ipc::WindowsIcsRepairResult> {
+    SERVICE_MANAGER.repair_windows_ics(&request).await.stringify_err()
+}

@@ -3,6 +3,8 @@ use crate::{
     core::{logger::Logger, tray::Tray},
     utils::dirs,
 };
+#[cfg(target_os = "windows")]
+use crate::{core::handle::Handle, process::AsyncHandler};
 use anyhow::{Context as _, Result, bail};
 use backon::{ConstantBuilder, Retryable as _};
 use clash_verge_logging::{Type, logging};
@@ -11,6 +13,8 @@ use compact_str::CompactString;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use scopeguard::defer;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 use std::{
     borrow::Cow,
     env::current_exe,
@@ -38,6 +42,11 @@ pub struct ServiceManager {
     operation_running: AtomicBool,
     operation_done: Notify,
 }
+
+#[cfg(target_os = "windows")]
+static WINDOWS_ICS_AUTO_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static WINDOWS_ICS_AUTO_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(target_os = "macos"))]
 fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
@@ -610,6 +619,44 @@ impl ServiceManager {
         Ok(())
     }
 
+    pub async fn list_windows_ics_connections(&self) -> Result<Vec<clash_verge_service_ipc::WindowsIcsConnection>> {
+        #[cfg(target_os = "windows")]
+        {
+            let response = clash_verge_service_ipc::list_windows_ics_connections()
+                .await
+                .context("unable to list Windows ICS connections")?;
+            if response.code > 0 {
+                bail!(response.message);
+            }
+            Ok(response.data.unwrap_or_default())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        bail!("Windows ICS is only available on Windows")
+    }
+
+    pub async fn repair_windows_ics(
+        &self,
+        request: &clash_verge_service_ipc::WindowsIcsRepairRequest,
+    ) -> Result<clash_verge_service_ipc::WindowsIcsRepairResult> {
+        #[cfg(target_os = "windows")]
+        {
+            let response = clash_verge_service_ipc::repair_windows_ics(request)
+                .await
+                .context("unable to repair Windows ICS")?;
+            if response.code > 0 {
+                bail!(response.message);
+            }
+            response.data.context("Windows ICS repair returned no result")
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            bail!("Windows ICS is only available on Windows")
+        }
+    }
+
     pub async fn current(&self) -> ServiceStatus {
         loop {
             let notified = self.operation_done.notified();
@@ -699,6 +746,177 @@ impl ServiceManager {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn build_windows_ics_repair_request(
+    recovery_enabled: bool,
+    tun_enabled: bool,
+    public_name: Option<&str>,
+    private_guid: Option<&str>,
+    private_name: Option<&str>,
+    force_rebind: bool,
+) -> Result<Option<clash_verge_service_ipc::WindowsIcsRepairRequest>> {
+    if !recovery_enabled || !tun_enabled {
+        return Ok(None);
+    }
+
+    let public_name = public_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Mihomo");
+    let private_guid = private_guid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let private_name = private_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
+    if private_guid.is_none() && private_name.is_none() {
+        bail!("Windows ICS private adapter is not configured");
+    }
+
+    Ok(Some(clash_verge_service_ipc::WindowsIcsRepairRequest {
+        public_connection: clash_verge_service_ipc::WindowsIcsConnectionSelector {
+            guid: None,
+            name: Some(public_name.to_owned()),
+        },
+        private_connection: clash_verge_service_ipc::WindowsIcsConnectionSelector {
+            guid: private_guid,
+            name: private_name,
+        },
+        force_rebind,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+async fn configured_windows_ics_repair_request(
+    force_rebind: bool,
+) -> Result<Option<clash_verge_service_ipc::WindowsIcsRepairRequest>> {
+    let verge = Config::verge().await.latest_arc();
+    let recovery_enabled = verge.enable_windows_ics_recovery.unwrap_or(false);
+    let tun_enabled = verge.enable_tun_mode.unwrap_or(false);
+    let private_guid = verge.windows_ics_private_adapter_guid.as_deref().map(str::to_owned);
+    let private_name = verge.windows_ics_private_adapter_name.as_deref().map(str::to_owned);
+    drop(verge);
+
+    let clash = Config::clash().await.latest_arc();
+    let public_name = clash
+        .0
+        .get("tun")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .and_then(|tun| tun.get("device"))
+        .and_then(serde_yaml_ng::Value::as_str)
+        .map(str::to_owned);
+    drop(clash);
+
+    build_windows_ics_repair_request(
+        recovery_enabled,
+        tun_enabled,
+        public_name.as_deref(),
+        private_guid.as_deref(),
+        private_name.as_deref(),
+        force_rebind,
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub async fn repair_configured_windows_ics(
+    force_rebind: bool,
+) -> Result<Option<clash_verge_service_ipc::WindowsIcsRepairResult>> {
+    let Some(request) = configured_windows_ics_repair_request(force_rebind).await? else {
+        return Ok(None);
+    };
+    SERVICE_MANAGER.repair_windows_ics(&request).await.map(Some)
+}
+
+#[cfg(target_os = "windows")]
+async fn wait_for_mihomo_controller_ready() -> Result<()> {
+    const READY_TIMEOUT: Duration = Duration::from_secs(15);
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+    const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let ready = {
+            let mihomo = Handle::mihomo().await;
+            tokio::time::timeout(PROBE_TIMEOUT, mihomo.get_version())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        };
+        if ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Mihomo controller did not become ready before Windows ICS recovery");
+        }
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn schedule_windows_ics_recovery(trigger: &'static str) {
+    WINDOWS_ICS_AUTO_RECOVERY_PENDING.store(true, Ordering::Release);
+    if WINDOWS_ICS_AUTO_RECOVERY_RUNNING.swap(true, Ordering::AcqRel) {
+        logging!(
+            debug,
+            Type::Service,
+            "Windows ICS recovery coalesced; trigger={trigger}"
+        );
+        return;
+    }
+
+    AsyncHandler::spawn(move || async move {
+        // TUN and Verge settings are saved by separate commands. Briefly
+        // debounce them so one user action does not rebind ICS twice.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        loop {
+            WINDOWS_ICS_AUTO_RECOVERY_PENDING.store(false, Ordering::Release);
+            let result = match configured_windows_ics_repair_request(true).await {
+                Ok(None) => Ok(None),
+                Ok(Some(_)) => match wait_for_mihomo_controller_ready().await {
+                    // Re-read the configuration after waiting so a setting
+                    // changed during startup cannot trigger a stale repair.
+                    Ok(()) => repair_configured_windows_ics(true).await,
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+
+            match result {
+                Ok(Some(result)) => logging!(
+                    info,
+                    Type::Service,
+                    "Windows ICS recovery completed; trigger={}, changed={}, rebound={}",
+                    trigger,
+                    result.changed,
+                    result.rebound
+                ),
+                Ok(None) => logging!(debug, Type::Service, "Windows ICS recovery skipped; trigger={trigger}"),
+                Err(err) => logging!(
+                    warn,
+                    Type::Service,
+                    "Windows ICS recovery failed; trigger={}: {}",
+                    trigger,
+                    err
+                ),
+            }
+
+            if WINDOWS_ICS_AUTO_RECOVERY_PENDING.load(Ordering::Acquire) {
+                continue;
+            }
+
+            WINDOWS_ICS_AUTO_RECOVERY_RUNNING.store(false, Ordering::Release);
+            if WINDOWS_ICS_AUTO_RECOVERY_PENDING.load(Ordering::Acquire)
+                && !WINDOWS_ICS_AUTO_RECOVERY_RUNNING.swap(true, Ordering::AcqRel)
+            {
+                continue;
+            }
+            break;
+        }
+    });
+}
+
 fn run_service_command(operation: impl FnOnce() -> Result<()>, label: &'static str) -> Result<()> {
     tokio::task::block_in_place(operation).with_context(|| format!("{label} failed"))
 }
@@ -758,6 +976,44 @@ mod tests {
         assert_eq!(resolved, Some(core_path));
 
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_ics_tests {
+    use super::build_windows_ics_repair_request;
+
+    #[test]
+    fn automatic_ics_repair_requires_both_switches() -> anyhow::Result<()> {
+        assert!(
+            build_windows_ics_repair_request(false, true, Some("Mihomo"), Some("{private-guid}"), None, false,)?
+                .is_none()
+        );
+        assert!(
+            build_windows_ics_repair_request(true, false, Some("Mihomo"), Some("{private-guid}"), None, false,)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_ics_repair_prefers_private_guid_and_forces_rebind() -> anyhow::Result<()> {
+        let request = build_windows_ics_repair_request(
+            true,
+            true,
+            Some("Mihomo"),
+            Some("{private-guid}"),
+            Some("vEthernet (Private)"),
+            true,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("repair request should be created"))?;
+
+        assert_eq!(request.public_connection.guid, None);
+        assert_eq!(request.public_connection.name.as_deref(), Some("Mihomo"));
+        assert_eq!(request.private_connection.guid.as_deref(), Some("{private-guid}"));
+        assert_eq!(request.private_connection.name.as_deref(), Some("vEthernet (Private)"));
+        assert!(request.force_rebind);
         Ok(())
     }
 }
