@@ -474,16 +474,26 @@
         "autoDetectInterface": "自動偵測流量輸出介面",
         "dnsHijack": "DNS 綁架",
         "mtu": "最大傳輸單位",
-        "autoRedirect": "自動重導"
+        "autoRedirect": "自動重導",
+        "icsRecovery": "自動恢復 Windows 網路共用",
+        "icsPrivateAdapter": "接收共用的私人介面卡"
       },
       "tooltips": {
         "dnsHijack": "請用半形逗號來區隔多個 DNS 伺服器",
-        "autoRedirect": "自動配置 nftables/iptables 的 TCP 重導"
+        "autoRedirect": "自動配置 nftables/iptables 的 TCP 重導",
+        "icsRecovery": "TUN 介面卡啟動後，將其網際網路連線共用恢復到所選私人介面卡。Windows 可能修改私人介面卡的網路設定；不會自動接管其他連線已有的共用。"
+      },
+      "actions": {
+        "icsRefreshAdapters": "重新整理",
+        "icsRepairNow": "立即修復"
       },
       "messages": {
         "applied": "設定已套用",
         "invalidRouteExcludeAddress": "請輸入有效的 CIDR 網段",
-        "routeExcludeAddressHint": "僅支援 IPv4/IPv6 CIDR，例如 192.168.0.0/16 或 fd00::/8"
+        "routeExcludeAddressHint": "僅支援 IPv4/IPv6 CIDR，例如 192.168.0.0/16 或 fd00::/8",
+        "icsPrivateAdapterRequired": "請選擇接收網路共用的私人介面卡",
+        "icsRepaired": "Windows 網路共用已修復",
+        "icsAlreadyHealthy": "Windows 網路共用狀態已正常"
       }
     },
     "dns": {

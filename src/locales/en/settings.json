@@ -474,16 +474,26 @@
         "autoDetectInterface": "Auto Detect Interface",
         "dnsHijack": "DNS Hijack",
         "mtu": "Max Transmission Unit",
-        "autoRedirect": "Auto Redirect"
+        "autoRedirect": "Auto Redirect",
+        "icsRecovery": "Restore Windows Internet Sharing",
+        "icsPrivateAdapter": "Private Shared Adapter"
       },
       "tooltips": {
         "dnsHijack": "Please use , to separate multiple DNS servers",
-        "autoRedirect": "Automatically configures nftables/iptables TCP redirects"
+        "autoRedirect": "Automatically configures nftables/iptables TCP redirects",
+        "icsRecovery": "After the TUN adapter starts, restore Internet Connection Sharing from it to the selected private adapter. Existing sharing owned by another connection is not taken over automatically."
+      },
+      "actions": {
+        "icsRefreshAdapters": "Refresh",
+        "icsRepairNow": "Repair Now"
       },
       "messages": {
         "applied": "Settings Applied",
         "invalidRouteExcludeAddress": "Please enter a valid CIDR block",
-        "routeExcludeAddressHint": "Only IPv4/IPv6 CIDR is supported, such as 192.168.0.0/16 or fd00::/8"
+        "routeExcludeAddressHint": "Only IPv4/IPv6 CIDR is supported, such as 192.168.0.0/16 or fd00::/8",
+        "icsPrivateAdapterRequired": "Select the private adapter that receives the shared connection",
+        "icsRepaired": "Windows Internet Connection Sharing was repaired",
+        "icsAlreadyHealthy": "Windows Internet Connection Sharing is already healthy"
       }
     },
     "dns": {

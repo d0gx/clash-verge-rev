@@ -19,8 +19,10 @@ const defaultSystemState = {
   isServiceOk: false,
 } as SystemState
 
-// Grace period for service initialization during startup
-const STARTUP_GRACE_MS = 10_000
+// Keep this longer than the backend's 30-second Windows service wait. Otherwise
+// a slow cold boot can persistently disable TUN while the service is still
+// starting, which also prevents post-start ICS recovery from running.
+const STARTUP_GRACE_MS = 35_000
 
 /**
  * 自定义 hook 用于获取系统运行状态

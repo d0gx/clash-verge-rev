@@ -295,6 +295,33 @@ interface INetworkInterface {
   index: number
 }
 
+type WindowsIcsSharingRole = 'public' | 'private'
+
+interface WindowsIcsConnectionSelector {
+  guid?: string
+  name?: string
+}
+
+interface WindowsIcsConnection {
+  guid: string
+  name: string
+  deviceName: string
+  sharingRole: WindowsIcsSharingRole | null
+}
+
+interface WindowsIcsRepairRequest {
+  publicConnection: WindowsIcsConnectionSelector
+  privateConnection: WindowsIcsConnectionSelector
+  forceRebind: boolean
+}
+
+interface WindowsIcsRepairResult {
+  publicConnection: WindowsIcsConnection
+  privateConnection: WindowsIcsConnection
+  changed: boolean
+  rebound: boolean
+}
+
 interface ISeqProfileConfig {
   prepend: []
   append: []
@@ -894,6 +921,9 @@ interface IVergeConfig {
   tray_proxy_groups_display_mode?: 'default' | 'inline' | 'disable'
   tray_inline_outbound_modes?: boolean
   enable_tun_mode?: boolean
+  enable_windows_ics_recovery?: boolean
+  windows_ics_private_adapter_guid?: string
+  windows_ics_private_adapter_name?: string
   enable_auto_light_weight_mode?: boolean
   auto_light_weight_minutes?: number
   enable_auto_launch?: boolean

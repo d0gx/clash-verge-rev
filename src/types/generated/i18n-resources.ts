@@ -1013,12 +1013,18 @@ export interface TranslationResources {
           }
         }
         tun: {
+          actions: {
+            icsRefreshAdapters: string
+            icsRepairNow: string
+          }
           fields: {
             autoDetectInterface: string
             autoRedirect: string
             autoRoute: string
             device: string
             dnsHijack: string
+            icsPrivateAdapter: string
+            icsRecovery: string
             mtu: string
             routeExcludeAddress: string
             stack: string
@@ -1026,6 +1032,9 @@ export interface TranslationResources {
           }
           messages: {
             applied: string
+            icsAlreadyHealthy: string
+            icsPrivateAdapterRequired: string
+            icsRepaired: string
             invalidRouteExcludeAddress: string
             routeExcludeAddressHint: string
           }
@@ -1033,6 +1042,7 @@ export interface TranslationResources {
           tooltips: {
             autoRedirect: string
             dnsHijack: string
+            icsRecovery: string
           }
         }
         update: {

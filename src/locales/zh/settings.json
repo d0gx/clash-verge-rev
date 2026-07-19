@@ -474,16 +474,26 @@
         "autoDetectInterface": "自动选择流量出口接口",
         "dnsHijack": "DNS 劫持",
         "mtu": "最大传输单元",
-        "autoRedirect": "自动重定向"
+        "autoRedirect": "自动重定向",
+        "icsRecovery": "自动恢复 Windows 网络共享",
+        "icsPrivateAdapter": "接收共享的专用适配器"
       },
       "tooltips": {
         "dnsHijack": "多个 DNS 服务器请使用 , 分隔",
-        "autoRedirect": "自动配置 nftables/iptables 的 TCP 重定向"
+        "autoRedirect": "自动配置 nftables/iptables 的 TCP 重定向",
+        "icsRecovery": "TUN 适配器启动后，将它的 Internet 连接共享恢复到所选专用适配器。Windows 可能修改专用适配器的网络配置；不会自动接管其他连接已有的共享。"
+      },
+      "actions": {
+        "icsRefreshAdapters": "刷新",
+        "icsRepairNow": "立即修复"
       },
       "messages": {
         "applied": "设置已应用",
         "invalidRouteExcludeAddress": "请输入有效的 CIDR 网段",
-        "routeExcludeAddressHint": "仅支持 IPv4/IPv6 CIDR，例如 192.168.0.0/16 或 fd00::/8"
+        "routeExcludeAddressHint": "仅支持 IPv4/IPv6 CIDR，例如 192.168.0.0/16 或 fd00::/8",
+        "icsPrivateAdapterRequired": "请选择接收网络共享的专用适配器",
+        "icsRepaired": "Windows 网络共享已修复",
+        "icsAlreadyHealthy": "Windows 网络共享状态已经正常"
       }
     },
     "dns": {

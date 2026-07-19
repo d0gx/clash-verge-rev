@@ -506,6 +506,15 @@ export const isServiceAvailable = async () => {
     return false
   }
 }
+
+export const listWindowsIcsConnections = async () => {
+  return invoke<WindowsIcsConnection[]>('list_windows_ics_connections')
+}
+
+export const repairWindowsIcs = async (request: WindowsIcsRepairRequest) => {
+  return invoke<WindowsIcsRepairResult>('repair_windows_ics', { request })
+}
+
 export const entry_lightweight_mode = async () => {
   return invoke<void>('entry_lightweight_mode')
 }
