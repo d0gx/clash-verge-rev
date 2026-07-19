@@ -577,10 +577,31 @@ const resolveServicePermission = async () => {
 // =======================
 // Other resource resolvers (service, mmdb, geosite, geoip, enableLoopback)
 // =======================
-const SERVICE_LATEST_URL =
-  'https://github.com/clash-verge-rev/clash-verge-service-ipc/releases/latest'
-const SERVICE_URL_PREFIX =
-  'https://github.com/clash-verge-rev/clash-verge-service-ipc/releases/download'
+const OFFICIAL_SERVICE_REPOSITORY = 'clash-verge-rev/clash-verge-service-ipc'
+const OFFICIAL_SERVICE_VERSION = 'v2.3.3'
+const WINDOWS_ICS_SERVICE_REPOSITORY = 'd0gx/clash-verge-service-ipc'
+const WINDOWS_ICS_SERVICE_VERSION = 'v2.3.4-ics.1'
+const DEFAULT_SERVICE_REPOSITORY =
+  platform === 'win32'
+    ? WINDOWS_ICS_SERVICE_REPOSITORY
+    : OFFICIAL_SERVICE_REPOSITORY
+const SERVICE_REPOSITORY =
+  process.env.CLASH_VERGE_SERVICE_REPOSITORY?.trim() ||
+  DEFAULT_SERVICE_REPOSITORY
+const SERVICE_VERSION_OVERRIDE =
+  process.env.CLASH_VERGE_SERVICE_VERSION?.trim() ||
+  (SERVICE_REPOSITORY === WINDOWS_ICS_SERVICE_REPOSITORY
+    ? WINDOWS_ICS_SERVICE_VERSION
+    : SERVICE_REPOSITORY === OFFICIAL_SERVICE_REPOSITORY
+      ? OFFICIAL_SERVICE_VERSION
+      : undefined)
+const SERVICE_LATEST_URL = `https://github.com/${SERVICE_REPOSITORY}/releases/latest`
+const SERVICE_URL_PREFIX = `https://github.com/${SERVICE_REPOSITORY}/releases/download`
+const SERVICE_VERSION_CACHE_KEY = `SERVICE_VERSION:${SERVICE_REPOSITORY}`
+const SERVICE_BUNDLE_MANIFEST = path.join(
+  TEMP_DIR,
+  `.service_bundle_${SIDECAR_HOST}.json`,
+)
 let SERVICE_VERSION
 
 const SERVICE_BINARIES = [
@@ -604,8 +625,16 @@ function parseServiceVersionFromUrl(url) {
 }
 
 async function getLatestServiceVersion() {
+  if (SERVICE_VERSION_OVERRIDE) {
+    SERVICE_VERSION = SERVICE_VERSION_OVERRIDE
+    log_info(
+      `Using configured service version from ${SERVICE_REPOSITORY}: ${SERVICE_VERSION}`,
+    )
+    return
+  }
+
   if (!FORCE) {
-    const cached = await getCachedVersion('SERVICE_VERSION')
+    const cached = await getCachedVersion(SERVICE_VERSION_CACHE_KEY)
     if (cached) {
       SERVICE_VERSION = cached
       return
@@ -637,8 +666,10 @@ async function getLatestServiceVersion() {
         `Unable to resolve service release tag from ${response.url}`,
       )
 
-    log_info(`Latest service version: ${SERVICE_VERSION}`)
-    await setCachedVersion('SERVICE_VERSION', SERVICE_VERSION)
+    log_info(
+      `Latest service version from ${SERVICE_REPOSITORY}: ${SERVICE_VERSION}`,
+    )
+    await setCachedVersion(SERVICE_VERSION_CACHE_KEY, SERVICE_VERSION)
   } catch (err) {
     log_error('Error fetching latest service version:', err.message)
     process.exit(1)
@@ -658,6 +689,30 @@ async function findExtractedFile(dir, fileName) {
   return null
 }
 
+async function loadServiceBundleManifest() {
+  try {
+    return JSON.parse(await fsp.readFile(SERVICE_BUNDLE_MANIFEST, 'utf-8'))
+  } catch (ignoreErr) {
+    return null
+  }
+}
+
+async function saveServiceBundleManifest() {
+  await fsp.mkdir(TEMP_DIR, { recursive: true })
+  await fsp.writeFile(
+    SERVICE_BUNDLE_MANIFEST,
+    JSON.stringify(
+      {
+        repository: SERVICE_REPOSITORY,
+        version: SERVICE_VERSION,
+        sidecarHost: SIDECAR_HOST,
+      },
+      null,
+      2,
+    ),
+  )
+}
+
 async function resolveServiceBundle() {
   const files = SERVICE_BINARIES.map((name) => {
     const info = serviceFileInfo(name)
@@ -667,12 +722,23 @@ async function resolveServiceBundle() {
     }
   })
 
-  if (!FORCE && files.every(({ targetPath }) => fs.existsSync(targetPath))) {
-    log_success('"clash-verge-service-ipc" already exists, skipping download')
+  await getLatestServiceVersion()
+
+  const manifest = await loadServiceBundleManifest()
+  const bundleMatches =
+    manifest?.repository === SERVICE_REPOSITORY &&
+    manifest?.version === SERVICE_VERSION &&
+    manifest?.sidecarHost === SIDECAR_HOST
+  if (
+    !FORCE &&
+    bundleMatches &&
+    files.every(({ targetPath }) => fs.existsSync(targetPath))
+  ) {
+    log_success(
+      `"clash-verge-service-ipc" ${SERVICE_VERSION} from ${SERVICE_REPOSITORY} already exists, skipping download`,
+    )
     return
   }
-
-  await getLatestServiceVersion()
 
   const archiveExt = platform === 'win32' ? 'zip' : 'tar.gz'
   const archiveFile = `clash-verge-service-ipc-${SERVICE_VERSION}-${SIDECAR_HOST}.${archiveExt}`
@@ -698,17 +764,23 @@ async function resolveServiceBundle() {
       await extract({ cwd: tempDir, file: tempArchive })
     }
 
-    for (const { sourceFile, targetFile, targetPath } of files) {
+    const extractedFiles = []
+    for (const file of files) {
+      const { sourceFile } = file
       const extractedFile = await findExtractedFile(tempDir, sourceFile)
       if (!extractedFile) {
         throw new Error(`Expected binary ${sourceFile} not found in archive`)
       }
+      extractedFiles.push({ ...file, extractedFile })
+    }
 
+    for (const { extractedFile, targetFile, targetPath } of extractedFiles) {
       await fsp.copyFile(extractedFile, targetPath)
       if (platform !== 'win32') await fsp.chmod(targetPath, 0o755)
       await updateHashCache(targetPath)
       log_success(`Extracted service file: ${targetFile}`)
     }
+    await saveServiceBundleManifest()
 
     log_success(`service bundle finished: ${archiveFile}`)
   } finally {
