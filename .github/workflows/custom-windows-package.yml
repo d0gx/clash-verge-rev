@@ -1,0 +1,210 @@
+name: Custom Windows x64 package
+
+on:
+  push:
+    tags:
+      - 'build/windows-ics-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-windows-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  HUSKY: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout immutable tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify build-only source commit
+        shell: pwsh
+        run: |
+          $expectedFeatureSha = '93f65fc2e947330231b5c2fe0bb15f9a14f000d9'
+          $commitAndParents = @((git rev-list --parents -n 1 HEAD).Trim() -split '\s+')
+          if ($commitAndParents.Count -ne 2) {
+            throw 'The package workflow must be a single-parent commit'
+          }
+          $featureSha = $commitAndParents[1]
+          if ($featureSha -ne $expectedFeatureSha) {
+            throw "Build commit parent $featureSha does not match $expectedFeatureSha"
+          }
+          $changedPaths = @(git diff --name-only $expectedFeatureSha HEAD)
+          if (
+            $changedPaths.Count -ne 1 -or
+            $changedPaths[0] -ne '.github/workflows/custom-windows-package.yml'
+          ) {
+            throw "Build commit changed unexpected paths: $($changedPaths -join ', ')"
+          }
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.3.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.18.0'
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, resolved 2026-07-20
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve and verify build resources
+        shell: pwsh
+        run: |
+          $archiveName = 'clash-verge-service-ipc-v2.3.4-ics.1-x86_64-pc-windows-msvc.zip'
+          $releaseBase = 'https://github.com/d0gx/clash-verge-service-ipc/releases/download/v2.3.4-ics.1'
+          $archivePath = Join-Path $env:RUNNER_TEMP $archiveName
+          $sumsPath = Join-Path $env:RUNNER_TEMP 'service-SHA256SUMS'
+          $verifiedServiceDir = Join-Path $env:RUNNER_TEMP 'verified-service-bundle'
+          Invoke-WebRequest -Uri "$releaseBase/$archiveName" -OutFile $archivePath
+          Invoke-WebRequest -Uri "$releaseBase/SHA256SUMS" -OutFile $sumsPath
+
+          $sumLine = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match [regex]::Escape($archiveName) })
+          if ($sumLine.Count -ne 1) {
+            throw 'The service SHA256SUMS must contain exactly one x64 entry'
+          }
+          if ($sumLine[0] -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
+            throw 'The service SHA256SUMS x64 entry is invalid'
+          }
+          $publishedArchiveHash = $matches[1].ToUpperInvariant()
+          $auditedArchiveHash = '2990E28C9908C4D53F328BE9628ECA164AAC6873FCEFC624CCB0DDB3006A5F69'
+          $downloadedArchiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+          if (
+            $publishedArchiveHash -ne $auditedArchiveHash -or
+            $downloadedArchiveHash -ne $auditedArchiveHash
+          ) {
+            throw 'The service release archive no longer matches the audited SHA256'
+          }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $verifiedServiceDir
+
+          pnpm run prebuild x86_64-pc-windows-msvc --force
+
+          $manifestPath = 'node_modules/.verge/.service_bundle_x86_64-pc-windows-msvc.json'
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw 'Service bundle manifest was not generated'
+          }
+
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if (
+            $manifest.schemaVersion -ne 1 -or
+            $manifest.repository -ne 'd0gx/clash-verge-service-ipc' -or
+            $manifest.version -ne 'v2.3.4-ics.1' -or
+            $manifest.sidecarHost -ne 'x86_64-pc-windows-msvc'
+          ) {
+            throw 'Unexpected service bundle identity'
+          }
+
+          $serviceFiles = @(
+            'clash-verge-service.exe',
+            'clash-verge-service-install.exe',
+            'clash-verge-service-uninstall.exe'
+          )
+          foreach ($name in $serviceFiles) {
+            $path = Join-Path 'src-tauri/resources' $name
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $recorded = [string]$manifest.files.$name
+            $released = (Get-FileHash -LiteralPath (Join-Path $verifiedServiceDir $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $recorded -or $actual -ne $released) {
+              throw "Service bundle hash mismatch for $name"
+            }
+          }
+
+      - name: Create unsigned local-build configuration
+        shell: pwsh
+        run: |
+          $configPath = Join-Path $env:RUNNER_TEMP 'tauri.custom-x64.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' |
+            Set-Content -LiteralPath $configPath -Encoding utf8 -NoNewline
+          "TAURI_BUILD_CONFIG=$configPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build x64 NSIS installer
+        shell: pwsh
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+        run: >-
+          pnpm tauri build
+          --target x86_64-pc-windows-msvc
+          --bundles nsis
+          --config "$env:TAURI_BUILD_CONFIG"
+          --no-sign
+          --ci
+
+      - name: Verify and stage installer artifact
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+        run: |
+          $bundleDir = 'target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $setups = @(Get-ChildItem -LiteralPath $bundleDir -File -Filter '*-setup.exe')
+          if ($setups.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($setups.Count)"
+          }
+
+          $unexpectedUpdaterArtifacts = @(
+            Get-ChildItem -LiteralPath $bundleDir -File |
+              Where-Object { $_.Name -like '*.sig' -or $_.Name -like '*.nsis.zip' }
+          )
+          if ($unexpectedUpdaterArtifacts.Count -ne 0) {
+            throw 'Updater artifacts were generated for an unsigned local build'
+          }
+
+          $outputDir = Join-Path $env:RUNNER_TEMP 'custom-windows-package'
+          New-Item -ItemType Directory -Path $outputDir | Out-Null
+          $installer = $setups[0]
+          $signatureStatus = (Get-AuthenticodeSignature -LiteralPath $installer.FullName).Status.ToString()
+          if ($signatureStatus -ne 'NotSigned') {
+            throw "Expected an unsigned installer, got Authenticode status $signatureStatus"
+          }
+          Copy-Item -LiteralPath $installer.FullName -Destination $outputDir
+
+          $installerHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
+          "$installerHash  $($installer.Name)" |
+            Set-Content -LiteralPath (Join-Path $outputDir 'SHA256SUMS') -Encoding ascii
+          Copy-Item -LiteralPath 'node_modules/.verge/.service_bundle_x86_64-pc-windows-msvc.json' -Destination (Join-Path $outputDir 'service-bundle-manifest.json')
+
+          $buildInfo = [ordered]@{
+            sourceSha = $env:SOURCE_SHA
+            sourceTag = $env:SOURCE_TAG
+            featureSourceSha = '93f65fc2e947330231b5c2fe0bb15f9a14f000d9'
+            appVersion = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+            rustc = (rustc --version)
+            target = 'x86_64-pc-windows-msvc'
+            updaterArtifacts = $false
+            authenticodeSigned = $false
+            authenticodeStatus = $signatureStatus
+            installer = $installer.Name
+            installerSha256 = $installerHash
+            serviceRepository = 'd0gx/clash-verge-service-ipc'
+            serviceVersion = 'v2.3.4-ics.1'
+          }
+          $buildInfo | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $outputDir 'BUILD-INFO.json') -Encoding utf8
+
+      - name: Upload verified installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Clash-Verge-2.5.3-ICS-x64-NSIS
+          path: ${{ runner.temp }}/custom-windows-package/*
+          if-no-files-found: error
+          retention-days: 30
