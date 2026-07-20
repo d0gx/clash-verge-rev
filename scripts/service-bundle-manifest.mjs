@@ -1,4 +1,4 @@
-export const SERVICE_BUNDLE_MANIFEST_SCHEMA = 1
+const SERVICE_BUNDLE_MANIFEST_SCHEMA = 1
 
 async function collectFileHashes(files, calculateFileHash) {
   const hashes = {}
