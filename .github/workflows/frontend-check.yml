@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   HUSKY: 0
@@ -24,6 +25,7 @@ jobs:
             frontend:
               - 'src/**'
               - '**/*.js'
+              - '**/*.mjs'
               - '**/*.ts'
               - '**/*.tsx'
               - '**/*.css'
@@ -37,6 +39,7 @@ jobs:
               - 'eslint.config.ts'
               - 'tsconfig.json'
               - 'vite.config.*'
+              - '.github/workflows/frontend-check.yml'
 
       - name: Skip if no frontend changes
         if: steps.check_frontend.outputs.frontend != 'true'
@@ -65,6 +68,10 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
         if: steps.check_frontend.outputs.frontend == 'true'
+
+      - name: Test service bundle manifest
+        if: steps.check_frontend.outputs.frontend == 'true'
+        run: pnpm test:service-bundle-manifest
 
       - name: Run Prettier check
         if: steps.check_frontend.outputs.frontend == 'true'

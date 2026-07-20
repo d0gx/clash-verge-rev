@@ -10,6 +10,10 @@ import { glob } from 'glob'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { extract } from 'tar'
 
+import {
+  createServiceBundleManifest,
+  serviceBundleMatches,
+} from './service-bundle-manifest.mjs'
 import { log_debug, log_error, log_info, log_success } from './utils.mjs'
 
 /**
@@ -697,19 +701,24 @@ async function loadServiceBundleManifest() {
   }
 }
 
-async function saveServiceBundleManifest() {
+function serviceBundleIdentity() {
+  return {
+    repository: SERVICE_REPOSITORY,
+    version: SERVICE_VERSION,
+    sidecarHost: SIDECAR_HOST,
+  }
+}
+
+async function saveServiceBundleManifest(files) {
+  const manifest = await createServiceBundleManifest(
+    serviceBundleIdentity(),
+    files,
+    calculateFileHash,
+  )
   await fsp.mkdir(TEMP_DIR, { recursive: true })
   await fsp.writeFile(
     SERVICE_BUNDLE_MANIFEST,
-    JSON.stringify(
-      {
-        repository: SERVICE_REPOSITORY,
-        version: SERVICE_VERSION,
-        sidecarHost: SIDECAR_HOST,
-      },
-      null,
-      2,
-    ),
+    JSON.stringify(manifest, null, 2),
   )
 }
 
@@ -725,10 +734,12 @@ async function resolveServiceBundle() {
   await getLatestServiceVersion()
 
   const manifest = await loadServiceBundleManifest()
-  const bundleMatches =
-    manifest?.repository === SERVICE_REPOSITORY &&
-    manifest?.version === SERVICE_VERSION &&
-    manifest?.sidecarHost === SIDECAR_HOST
+  const bundleMatches = await serviceBundleMatches(
+    manifest,
+    serviceBundleIdentity(),
+    files,
+    calculateFileHash,
+  )
   if (
     !FORCE &&
     bundleMatches &&
@@ -780,7 +791,7 @@ async function resolveServiceBundle() {
       await updateHashCache(targetPath)
       log_success(`Extracted service file: ${targetFile}`)
     }
-    await saveServiceBundleManifest()
+    await saveServiceBundleManifest(files)
 
     log_success(`service bundle finished: ${archiveFile}`)
   } finally {
