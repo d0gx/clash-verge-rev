@@ -4,7 +4,11 @@ use crate::{
     utils::dirs,
 };
 #[cfg(target_os = "windows")]
-use crate::{core::handle::Handle, process::AsyncHandler};
+use crate::{
+    config::{IVerge, runtime::IRuntime},
+    core::CoreManager,
+    process::AsyncHandler,
+};
 use anyhow::{Context as _, Result, bail};
 use backon::{ConstantBuilder, Retryable as _};
 use clash_verge_logging::{Type, logging};
@@ -13,6 +17,8 @@ use compact_str::CompactString;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use scopeguard::defer;
+#[cfg(target_os = "windows")]
+use std::sync::{Arc, atomic::AtomicU64};
 #[cfg(target_os = "windows")]
 use std::time::Instant;
 use std::{
@@ -25,6 +31,20 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Notify;
+#[cfg(target_os = "windows")]
+use {
+    std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+    windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, ERROR_SERVICE_DOES_NOT_EXIST, GetLastError, STILL_ACTIVE},
+        System::{
+            Services::{
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+                SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+            },
+            Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceStatus {
@@ -41,12 +61,222 @@ pub struct ServiceManager {
     status: Mutex<ServiceStatus>,
     operation_running: AtomicBool,
     operation_done: Notify,
+    /// Startup maintenance can display UAC. Never turn a delayed or rejected
+    /// prompt into an automatic prompt loop within one application process.
+    startup_maintenance_attempted: AtomicBool,
 }
 
 #[cfg(target_os = "windows")]
 static WINDOWS_ICS_AUTO_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
-static WINDOWS_ICS_AUTO_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
+static WINDOWS_ICS_AUTO_RECOVERY_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static WINDOWS_ICS_CONFIG_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(target_os = "windows")]
+static WINDOWS_ICS_CONFIG_TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "windows")]
+static ACTIVE_WINDOWS_ICS_CONFIG_TRANSACTION: Lazy<Mutex<Option<ActiveWindowsIcsConfigTransaction>>> =
+    Lazy::new(|| Mutex::new(None));
+#[cfg(target_os = "windows")]
+static INCOMPATIBLE_SERVICE_UPGRADE_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+type WindowsIcsRecoveryConfigSnapshot = clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot;
+
+#[cfg(target_os = "windows")]
+type WindowsIcsRollbackReceipt = Arc<Mutex<Option<WindowsIcsRecoveryConfigSnapshot>>>;
+
+#[cfg(target_os = "windows")]
+struct ActiveWindowsIcsConfigTransaction {
+    id: u64,
+    receipt: WindowsIcsRollbackReceipt,
+}
+
+/// Binds all Windows ICS CAS writes to one held CoreManager config gate.
+/// Dropping this scope invalidates every snapshot/token captured by that
+/// transaction before the next transaction may acquire the gate.
+#[cfg(target_os = "windows")]
+pub(crate) struct WindowsIcsConfigTransactionScope {
+    id: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsIcsConfigTransactionScope {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_WINDOWS_ICS_CONFIG_TRANSACTION.lock();
+        let is_active = active.as_ref().is_some_and(|transaction| transaction.id == self.id);
+        debug_assert!(is_active, "Windows ICS config transaction scope was not active at drop");
+        if is_active {
+            active.take();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn begin_windows_ics_config_transaction() -> WindowsIcsConfigTransactionScope {
+    let id = WINDOWS_ICS_CONFIG_TRANSACTION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    let mut active = ACTIVE_WINDOWS_ICS_CONFIG_TRANSACTION.lock();
+    assert!(
+        active.is_none(),
+        "CoreManager config gate must serialize Windows ICS transactions"
+    );
+    *active = Some(ActiveWindowsIcsConfigTransaction {
+        id,
+        receipt: Arc::new(Mutex::new(None)),
+    });
+    drop(active);
+    WindowsIcsConfigTransactionScope { id }
+}
+
+#[cfg(target_os = "windows")]
+fn active_windows_ics_config_transaction() -> Result<(u64, WindowsIcsRollbackReceipt)> {
+    ACTIVE_WINDOWS_ICS_CONFIG_TRANSACTION
+        .lock()
+        .as_ref()
+        .map(|transaction| (transaction.id, Arc::clone(&transaction.receipt)))
+        .context("Windows ICS mutation requires an active CoreManager config transaction")
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+pub(crate) struct WindowsIcsRecoveryTransaction {
+    original: WindowsIcsRecoveryConfigSnapshot,
+    scope_id: u64,
+    receipt: WindowsIcsRollbackReceipt,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsIcsRollbackDecision {
+    AlreadyRestored,
+    CompareAndSwap { expected_generation: u64 },
+    Conflict,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ics_rollback_decision(
+    original: &WindowsIcsRecoveryConfigSnapshot,
+    current: &WindowsIcsRecoveryConfigSnapshot,
+    applied: Option<&WindowsIcsRecoveryConfigSnapshot>,
+) -> WindowsIcsRollbackDecision {
+    if current.config == original.config {
+        WindowsIcsRollbackDecision::AlreadyRestored
+    } else if applied == Some(current) {
+        WindowsIcsRollbackDecision::CompareAndSwap {
+            expected_generation: current.generation,
+        }
+    } else {
+        WindowsIcsRollbackDecision::Conflict
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn incompatible_service_upgrade_pending() -> bool {
+    INCOMPATIBLE_SERVICE_UPGRADE_PENDING.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "windows")]
+fn mark_incompatible_service_upgrade_pending() {
+    INCOMPATIBLE_SERVICE_UPGRADE_PENDING.store(true, Ordering::Release);
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn is_mihomo_controller_present() -> bool {
+    Path::new(IClashTemp::guard_external_controller_ipc().as_str()).exists()
+}
+
+/// A legacy service does not participate in the new core-owner Event. Before
+/// starting a sidecar, query SCM directly so a running/starting/stopping old
+/// service cannot race us even when its IPC endpoint is temporarily absent.
+/// Only an absent service is safe to bypass. Even a stopped legacy service can
+/// be started later and does not participate in the new core-owner Event.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindowsScmServiceState {
+    Absent,
+    Stopped,
+    Active,
+}
+
+#[cfg(target_os = "windows")]
+const fn classify_installed_windows_scm_state(current_state: u32) -> WindowsScmServiceState {
+    if current_state == SERVICE_STOPPED {
+        WindowsScmServiceState::Stopped
+    } else {
+        WindowsScmServiceState::Active
+    }
+}
+
+#[cfg(target_os = "windows")]
+const fn windows_scm_state_allows_sidecar(state: WindowsScmServiceState) -> bool {
+    matches!(state, WindowsScmServiceState::Absent)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn query_windows_scm_service_state() -> Result<WindowsScmServiceState> {
+    let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm.is_null() {
+        return Err(std::io::Error::last_os_error()).context("unable to open Windows Service Control Manager");
+    }
+    defer! {
+        unsafe {
+            CloseServiceHandle(scm);
+        }
+    }
+
+    let service_name = "clash_verge_service"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let service = unsafe { OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if service.is_null() {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(WindowsScmServiceState::Absent);
+        }
+        return Err(std::io::Error::from_raw_os_error(error as i32))
+            .context("unable to open clash_verge_service for status query");
+    }
+    defer! {
+        unsafe {
+            CloseServiceHandle(service);
+        }
+    }
+
+    let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+    let mut bytes_needed = 0;
+    let queried = unsafe {
+        QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            std::ptr::from_mut(&mut status).cast::<u8>(),
+            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+            &mut bytes_needed,
+        )
+    };
+    if queried == 0 {
+        return Err(std::io::Error::last_os_error()).context("unable to query clash_verge_service status");
+    }
+
+    Ok(classify_installed_windows_scm_state(status.dwCurrentState))
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_scm_allows_sidecar() -> Result<bool> {
+    Ok(windows_scm_state_allows_sidecar(query_windows_scm_service_state()?))
+}
+
+/// Whether a foreground configuration transaction can publish a persistent
+/// Windows ICS desired state to the service.  Keep callers' rollback decision
+/// on the same predicate as the actual sync path.
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_ics_service_sync_required(
+    running_as_service: bool,
+    previous_recovery_enabled: Option<bool>,
+    current_recovery_enabled: Option<bool>,
+) -> bool {
+    running_as_service || previous_recovery_enabled.unwrap_or(false) || current_recovery_enabled.unwrap_or(false)
+}
 
 #[cfg(not(target_os = "macos"))]
 fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
@@ -558,6 +788,72 @@ pub(super) async fn stop_core_by_service() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+const fn service_status_confirms_running_core(
+    core_pid: Option<u32>,
+    service_state: clash_verge_service_ipc::ServiceLifecycleState,
+) -> bool {
+    core_pid.is_some() && matches!(service_state, clash_verge_service_ipc::ServiceLifecycleState::Running)
+}
+
+/// Resolve an ambiguous StartClash result. A lost IPC response does not mean
+/// the service failed to start the core, but durable desired intent alone also
+/// does not prove that the service has a usable core. The owner lease is only a
+/// fail-closed exclusion signal: it can remain held while startup cleanup is
+/// degraded. Only a live PID in the Running lifecycle may select Service mode.
+#[cfg(target_os = "windows")]
+pub(super) async fn query_service_status() -> Result<clash_verge_service_ipc::ServiceStatusSnapshot> {
+    let response = clash_verge_service_ipc::get_status()
+        .await
+        .context("unable to query Clash Verge Service status")?;
+    if response.code > 0 {
+        bail!(response.message);
+    }
+    response.data.context("service status response has no data")
+}
+
+/// Return a live status only when the endpoint speaks the exact Windows
+/// service protocol bundled with this client. A cached `ServiceStatus::Ready`
+/// is deliberately insufficient here: the service may have restarted or been
+/// replaced since that cache entry was produced.
+#[cfg(target_os = "windows")]
+pub(super) async fn query_compatible_service_status() -> Result<clash_verge_service_ipc::ServiceStatusSnapshot> {
+    if !is_service_ipc_path_exists() {
+        bail!("Clash Verge Service IPC endpoint is not present");
+    }
+
+    let version_response = clash_verge_service_ipc::get_version()
+        .await
+        .context("unable to query Clash Verge Service version")?;
+    if version_response.code > 0 {
+        bail!(version_response.message);
+    }
+    let version = version_response.data.context("service version response has no data")?;
+    if version.as_str() != clash_verge_service_ipc::VERSION {
+        mark_incompatible_service_upgrade_pending();
+        bail!(
+            "Clash Verge Service version {version} is incompatible with bundled protocol {}",
+            clash_verge_service_ipc::VERSION
+        );
+    }
+
+    let status = query_service_status().await?;
+    // Only an exact-version endpoint plus a live status response completes a
+    // previously observed legacy-service upgrade. A transient endpoint gap is
+    // intentionally unable to clear this process-lifetime latch.
+    INCOMPATIBLE_SERVICE_UPGRADE_PENDING.store(false, Ordering::Release);
+    Ok(status)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) async fn service_core_running() -> Result<bool> {
+    let status = query_compatible_service_status().await?;
+    Ok(service_status_confirms_running_core(
+        status.core_pid,
+        status.service_state,
+    ))
+}
+
 /// 检查服务是否正在运行
 pub async fn is_service_available() -> Result<()> {
     if let Err(e) = Path::metadata(clash_verge_service_ipc::IPC_PATH.as_ref()) {
@@ -600,6 +896,108 @@ async fn wait_for_service_ipc(manager: &ServiceManager) -> Result<()> {
 
 pub fn is_service_ipc_path_exists() -> bool {
     Path::new(clash_verge_service_ipc::IPC_PATH).exists()
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_service_owner_present() -> bool {
+    let paths = clash_verge_service_ipc::service_paths();
+    if !paths.owner_lock_path().exists() && !paths.pid_file_path().exists() {
+        return false;
+    }
+
+    let pid = std::fs::read_to_string(paths.pid_file_path())
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        .or_else(|| {
+            std::fs::read_to_string(paths.owner_lock_path())
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+        });
+    let Some(pid) = pid else {
+        // A lock can exist briefly before metadata is flushed. Treat an
+        // unparseable owner as live rather than crossing the ownership line.
+        return true;
+    };
+
+    unsafe {
+        let raw_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw_handle.is_null() {
+            // Invalid PID is a stale artifact; access denied is conservatively
+            // treated as a live service owner.
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        let handle = OwnedHandle::from_raw_handle(raw_handle);
+        let mut exit_code = 0;
+        GetExitCodeProcess(handle.as_raw_handle(), &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+/// Start automatic service maintenance once for this application process.
+///
+/// The detached task owns the complete operation, including a potentially
+/// delayed UAC-backed installer. Windows core startup performs independent
+/// live probes, so its timeout cannot cancel the owner and accidentally clear
+/// the operation guard while the installer is still running.
+#[cfg(target_os = "windows")]
+pub fn schedule_startup_service_maintenance() {
+    if SERVICE_MANAGER
+        .startup_maintenance_attempted
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+
+    AsyncHandler::spawn(|| async {
+        let deadline = tokio::time::Instant::now() + crate::constants::timing::SERVICE_HANDOFF_WINDOW;
+        let mut start_attempted = false;
+        let result = loop {
+            if is_service_ipc_path_exists() {
+                match SERVICE_MANAGER.init().await {
+                    Ok(()) => break SERVICE_MANAGER.refresh().await,
+                    Err(error) => logging!(debug, Type::Service, "startup service connection not ready: {error}"),
+                }
+            }
+
+            match query_windows_scm_service_state() {
+                Ok(WindowsScmServiceState::Absent) => {
+                    // No service is the normal sidecar-only installation. Do
+                    // not latch or auto-install, but keep observing during the
+                    // handoff window in case the user installs it explicitly.
+                }
+                Ok(WindowsScmServiceState::Stopped) => {
+                    mark_incompatible_service_upgrade_pending();
+                    if !start_attempted {
+                        start_attempted = true;
+                        if let Err(error) = run_service_command(install_service, "start installed service").await {
+                            break Err(error);
+                        }
+                    }
+                }
+                Ok(WindowsScmServiceState::Active) => {
+                    // The endpoint may disappear while an old service is
+                    // stopping/reinstalling. Latch before observing that gap.
+                    mark_incompatible_service_upgrade_pending();
+                }
+                Err(error) => {
+                    mark_incompatible_service_upgrade_pending();
+                    break Err(error).context("unable to determine installed service state");
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                break Err(anyhow::anyhow!(
+                    "service did not become reachable in the startup maintenance window"
+                ));
+            }
+            tokio::time::sleep(crate::constants::timing::SERVICE_WAIT_INTERVAL).await;
+        };
+
+        match result {
+            Ok(()) => schedule_windows_ics_recovery("service-maintenance-ready"),
+            Err(error) => logging!(warn, Type::Service, "startup service maintenance failed: {error}"),
+        }
+    });
 }
 
 impl ServiceManager {
@@ -657,16 +1055,25 @@ impl ServiceManager {
         }
     }
 
+    /// Wait for an install/reinstall operation before selecting a core mode.
+    /// Unix services do not participate in the Windows core-owner Event, so
+    /// their startup path must retain this ordering barrier.
+    #[cfg(not(target_os = "windows"))]
     pub async fn current(&self) -> ServiceStatus {
         loop {
             let notified = self.operation_done.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` stores no permit. Register this waiter before
+            // observing the atomic so completion between the check and await
+            // cannot strand Unix startup indefinitely.
+            notified.as_mut().enable();
             if !self.operation_running.load(Ordering::Acquire) {
                 let status = self.status.lock().clone();
                 if !self.operation_running.load(Ordering::Acquire) {
                     return status;
                 }
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 
@@ -692,7 +1099,15 @@ impl ServiceManager {
 
     pub async fn refresh(&self) -> Result<()> {
         self.run_operation(async {
-            self.apply_service_status(if clash_verge_service_ipc::is_reinstall_service_needed().await {
+            let reinstall_needed = clash_verge_service_ipc::is_reinstall_service_needed().await;
+            #[cfg(target_os = "windows")]
+            if reinstall_needed {
+                // Latch before invoking the UAC-backed reinstall. The old
+                // endpoint disappears during a normal upgrade, but that gap
+                // must not authorize a sidecar while an old core may survive.
+                mark_incompatible_service_upgrade_pending();
+            }
+            self.apply_service_status(if reinstall_needed {
                 ServiceStatus::NeedsReinstall
             } else {
                 ServiceStatus::Ready
@@ -711,29 +1126,37 @@ impl ServiceManager {
         match status {
             ServiceStatus::Ready => logging!(info, Type::Service, "服务就绪，直接启动"),
             ServiceStatus::NeedsReinstall | ServiceStatus::ReinstallRequired => {
+                #[cfg(target_os = "windows")]
+                mark_incompatible_service_upgrade_pending();
                 logging!(info, Type::Service, "服务需要重装，执行重装流程");
-                run_service_command(reinstall_service, "reinstall service")?;
+                run_service_command(reinstall_service, "reinstall service").await?;
                 wait_for_service_ipc(self).await?;
             }
             ServiceStatus::ForceReinstallRequired => {
+                #[cfg(target_os = "windows")]
+                mark_incompatible_service_upgrade_pending();
                 logging!(info, Type::Service, "服务需要强制重装，执行强制重装流程");
-                run_service_command(force_reinstall_service, "force reinstall service")?;
+                run_service_command(force_reinstall_service, "force reinstall service").await?;
                 wait_for_service_ipc(self).await?;
             }
             ServiceStatus::InstallRequired => {
+                #[cfg(target_os = "windows")]
+                mark_incompatible_service_upgrade_pending();
                 logging!(info, Type::Service, "需要安装服务，执行安装流程");
-                run_service_command(install_service, "install service")?;
+                run_service_command(install_service, "install service").await?;
                 wait_for_service_ipc(self).await?;
                 if clash_verge_service_ipc::is_reinstall_service_needed().await {
+                    #[cfg(target_os = "windows")]
+                    mark_incompatible_service_upgrade_pending();
                     logging!(info, Type::Service, "服务版本不匹配，执行重装流程");
                     self.set_status(ServiceStatus::NeedsReinstall);
-                    run_service_command(reinstall_service, "reinstall service")?;
+                    run_service_command(reinstall_service, "reinstall service").await?;
                     wait_for_service_ipc(self).await?;
                 }
             }
             ServiceStatus::UninstallRequired => {
                 logging!(info, Type::Service, "服务需要卸载，执行卸载流程");
-                run_service_command(uninstall_service, "uninstall service")?;
+                run_service_command(uninstall_service, "uninstall service").await?;
                 self.set_status(ServiceStatus::Unavailable("Service Uninstalled".into()));
             }
             ServiceStatus::Unavailable(reason) => {
@@ -790,73 +1213,237 @@ fn build_windows_ics_repair_request(
 }
 
 #[cfg(target_os = "windows")]
-async fn configured_windows_ics_repair_request(
+fn windows_runtime_tun(runtime: &IRuntime) -> (bool, Option<&str>) {
+    let tun = runtime
+        .config
+        .as_ref()
+        .and_then(|config| config.get("tun"))
+        .and_then(serde_yaml_ng::Value::as_mapping);
+
+    (
+        tun.and_then(|tun| tun.get("enable"))
+            .and_then(serde_yaml_ng::Value::as_bool)
+            .unwrap_or(false),
+        tun.and_then(|tun| tun.get("device"))
+            .and_then(serde_yaml_ng::Value::as_str),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ics_repair_request_from_config(
+    verge: &IVerge,
+    runtime: &IRuntime,
     force_rebind: bool,
 ) -> Result<Option<clash_verge_service_ipc::WindowsIcsRepairRequest>> {
-    let verge = Config::verge().await.latest_arc();
-    let recovery_enabled = verge.enable_windows_ics_recovery.unwrap_or(false);
-    let tun_enabled = verge.enable_tun_mode.unwrap_or(false);
-    let private_guid = verge.windows_ics_private_adapter_guid.as_deref().map(str::to_owned);
-    let private_name = verge.windows_ics_private_adapter_name.as_deref().map(str::to_owned);
-    drop(verge);
-
-    let clash = Config::clash().await.latest_arc();
-    let public_name = clash
-        .0
-        .get("tun")
-        .and_then(serde_yaml_ng::Value::as_mapping)
-        .and_then(|tun| tun.get("device"))
-        .and_then(serde_yaml_ng::Value::as_str)
-        .map(str::to_owned);
-    drop(clash);
-
+    let (tun_enabled, public_name) = windows_runtime_tun(runtime);
     build_windows_ics_repair_request(
-        recovery_enabled,
+        verge.enable_windows_ics_recovery.unwrap_or(false),
         tun_enabled,
-        public_name.as_deref(),
-        private_guid.as_deref(),
-        private_name.as_deref(),
+        public_name,
+        verge.windows_ics_private_adapter_guid.as_deref(),
+        verge.windows_ics_private_adapter_name.as_deref(),
         force_rebind,
     )
 }
 
 #[cfg(target_os = "windows")]
-pub async fn repair_configured_windows_ics(
-    force_rebind: bool,
-) -> Result<Option<clash_verge_service_ipc::WindowsIcsRepairResult>> {
-    let Some(request) = configured_windows_ics_repair_request(force_rebind).await? else {
-        return Ok(None);
-    };
-    SERVICE_MANAGER.repair_windows_ics(&request).await.map(Some)
+fn windows_ics_recovery_config_from_config(
+    verge: &IVerge,
+    runtime: &IRuntime,
+) -> Result<Option<clash_verge_service_ipc::WindowsIcsRecoveryConfig>> {
+    Ok(
+        windows_ics_repair_request_from_config(verge, runtime, true)?.map(|request| {
+            clash_verge_service_ipc::WindowsIcsRecoveryConfig {
+                public_connection: request.public_connection,
+                private_connection: request.private_connection,
+            }
+        }),
+    )
 }
 
 #[cfg(target_os = "windows")]
-async fn wait_for_mihomo_controller_ready() -> Result<()> {
-    const READY_TIMEOUT: Duration = Duration::from_secs(15);
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) async fn configure_windows_ics_recovery_for_config(verge: &IVerge, runtime: &IRuntime) -> Result<()> {
+    let _sync = WINDOWS_ICS_CONFIG_SYNC_LOCK.lock().await;
+    configure_windows_ics_recovery_for_config_unlocked(verge, runtime).await
+}
 
-    let deadline = Instant::now() + READY_TIMEOUT;
+#[cfg(target_os = "windows")]
+async fn configure_windows_ics_recovery_for_config_unlocked(verge: &IVerge, runtime: &IRuntime) -> Result<()> {
+    let config = windows_ics_recovery_config_from_config(verge, runtime)?;
+    configure_windows_ics_recovery_target_unlocked(config.as_ref())
+        .await
+        .map(drop)
+}
+
+#[cfg(target_os = "windows")]
+async fn configure_windows_ics_recovery_target_unlocked(
+    config: Option<&clash_verge_service_ipc::WindowsIcsRecoveryConfig>,
+) -> Result<clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot> {
+    let (_, receipt) = active_windows_ics_config_transaction()?;
+    let current = windows_ics_recovery_snapshot_unlocked().await?;
+    compare_and_swap_windows_ics_recovery_target_unlocked(config, current.generation, &receipt).await
+}
+
+#[cfg(target_os = "windows")]
+async fn compare_and_swap_windows_ics_recovery_target_unlocked(
+    config: Option<&clash_verge_service_ipc::WindowsIcsRecoveryConfig>,
+    expected_generation: u64,
+    receipt: &WindowsIcsRollbackReceipt,
+) -> Result<clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot> {
+    let update = clash_verge_service_ipc::WindowsIcsRecoveryConfigUpdate {
+        expected_generation,
+        config: config.cloned(),
+    };
+    // Exactly one mutation is sent for this observed generation. Retrying by
+    // reading a newer generation and rebasing the same payload would turn a
+    // stale transaction into a last-writer-wins overwrite.
+    let response = clash_verge_service_ipc::compare_and_swap_windows_ics_recovery_config(&update)
+        .await
+        .context("unable to configure persistent Windows ICS recovery")?;
+    if response.code > 0 {
+        let current_generation = response
+            .data
+            .as_ref()
+            .map(|snapshot| snapshot.generation)
+            .map_or_else(|| "unknown".to_string(), |generation| generation.to_string());
+        bail!(
+            "{} (expected generation {expected_generation}, current generation {current_generation})",
+            response.message
+        );
+    }
+    let applied = response
+        .data
+        .context("Windows ICS recovery CAS returned no applied snapshot")?;
+    if applied.generation == expected_generation || applied.config.as_ref() != config {
+        bail!(
+            "Windows ICS recovery CAS returned an unexpected snapshot (expected generation {expected_generation}, applied generation {})",
+            applied.generation
+        );
+    }
+    *receipt.lock() = Some(applied.clone());
+    Ok(applied)
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_ics_recovery_snapshot_unlocked() -> Result<clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot> {
+    let response = clash_verge_service_ipc::get_windows_ics_recovery_config_snapshot()
+        .await
+        .context("unable to snapshot persistent Windows ICS recovery")?;
+    if response.code > 0 {
+        bail!(response.message);
+    }
+    response.data.context("Windows ICS recovery snapshot returned no data")
+}
+
+/// Capture the service-owned target before a local configuration transaction
+/// can mutate it. Rollback must restore this authoritative value, not infer it
+/// from an execution runtime that may carry a session-only overlay.
+#[cfg(target_os = "windows")]
+pub(crate) async fn snapshot_windows_ics_recovery() -> Result<WindowsIcsRecoveryTransaction> {
+    let _sync = WINDOWS_ICS_CONFIG_SYNC_LOCK.lock().await;
+    let (scope_id, receipt) = active_windows_ics_config_transaction()?;
+    let original = windows_ics_recovery_snapshot_unlocked().await?;
+    Ok(WindowsIcsRecoveryTransaction {
+        original,
+        scope_id,
+        receipt,
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) async fn restore_windows_ics_recovery_snapshot(transaction: &WindowsIcsRecoveryTransaction) -> Result<()> {
+    let _sync = WINDOWS_ICS_CONFIG_SYNC_LOCK.lock().await;
+    let (active_scope_id, active_receipt) = active_windows_ics_config_transaction()?;
+    if active_scope_id != transaction.scope_id || !Arc::ptr_eq(&active_receipt, &transaction.receipt) {
+        bail!("refusing to use a Windows ICS rollback token outside its originating config transaction");
+    }
+
+    let current = windows_ics_recovery_snapshot_unlocked().await?;
+    let applied = transaction.receipt.lock().clone();
+    match windows_ics_rollback_decision(&transaction.original, &current, applied.as_ref()) {
+        WindowsIcsRollbackDecision::AlreadyRestored => Ok(()),
+        WindowsIcsRollbackDecision::CompareAndSwap { expected_generation } => {
+            compare_and_swap_windows_ics_recovery_target_unlocked(
+                transaction.original.config.as_ref(),
+                expected_generation,
+                &transaction.receipt,
+            )
+            .await
+            .map(drop)
+            .with_context(|| {
+                format!(
+                    "unable to restore Windows ICS recovery snapshot from generation {}",
+                    transaction.original.generation
+                )
+            })
+        }
+        WindowsIcsRollbackDecision::Conflict => bail!(
+            "refusing to restore Windows ICS generation {} over newer unowned generation {}; another client changed the recovery target",
+            transaction.original.generation,
+            current.generation
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) async fn configure_effective_windows_ics_recovery() -> Result<()> {
+    let verge = Config::verge().await.latest_arc();
+    let runtime = Config::runtime().await;
+    let runtime_latest = runtime.latest_arc();
+    let runtime_data = runtime.data_arc();
+    let runtime = if runtime_latest.config.is_some() {
+        &*runtime_latest
+    } else {
+        &*runtime_data
+    };
+    configure_windows_ics_recovery_for_config(&verge, runtime).await
+}
+
+#[cfg(target_os = "windows")]
+async fn configure_committed_windows_ics_recovery() -> Result<()> {
+    let manager = CoreManager::global();
+    let transaction = manager.begin_config_transaction().await;
+    // Keep the per-transaction CAS receipt and config snapshot linearized
+    // through the bounded IPC write. Retry sleep still happens after both
+    // gates are released, so foreground work is never blocked by backoff.
+    let sync = WINDOWS_ICS_CONFIG_SYNC_LOCK.lock().await;
+    let verge = (**Config::verge().await.data_arc()).clone();
+    let runtime = (**Config::runtime().await.data_arc()).clone();
+
+    let result = configure_windows_ics_recovery_for_config_unlocked(&verge, &runtime).await;
+    drop(sync);
+    drop(transaction);
+    result
+}
+
+#[cfg(target_os = "windows")]
+async fn configure_committed_windows_ics_recovery_with_retry() -> Result<()> {
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+    let deadline = Instant::now() + SYNC_TIMEOUT;
     loop {
-        let ready = {
-            let mihomo = Handle::mihomo().await;
-            tokio::time::timeout(PROBE_TIMEOUT, mihomo.get_version())
-                .await
-                .is_ok_and(|result| result.is_ok())
-        };
-        if ready {
-            return Ok(());
+        // The committed snapshot and one CAS remain one transaction. Both
+        // gates are released before any retry sleep.
+        let result = configure_committed_windows_ics_recovery().await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context("persistent Windows ICS configuration sync timed out");
+            }
+            Err(error) => logging!(
+                debug,
+                Type::Service,
+                "persistent Windows ICS configuration is not ready: {error}"
+            ),
         }
-        if Instant::now() >= deadline {
-            bail!("Mihomo controller did not become ready before Windows ICS recovery");
-        }
-        tokio::time::sleep(PROBE_INTERVAL).await;
+        tokio::time::sleep(SYNC_INTERVAL).await;
     }
 }
 
 #[cfg(target_os = "windows")]
 pub fn schedule_windows_ics_recovery(trigger: &'static str) {
-    WINDOWS_ICS_AUTO_RECOVERY_PENDING.store(true, Ordering::Release);
+    WINDOWS_ICS_AUTO_RECOVERY_GENERATION.fetch_add(1, Ordering::AcqRel);
     if WINDOWS_ICS_AUTO_RECOVERY_RUNNING.swap(true, Ordering::AcqRel) {
         logging!(
             debug,
@@ -867,47 +1454,39 @@ pub fn schedule_windows_ics_recovery(trigger: &'static str) {
     }
 
     AsyncHandler::spawn(move || async move {
-        // TUN and Verge settings are saved by separate commands. Briefly
-        // debounce them so one user action does not rebind ICS twice.
-        tokio::time::sleep(Duration::from_millis(250)).await;
         loop {
-            WINDOWS_ICS_AUTO_RECOVERY_PENDING.store(false, Ordering::Release);
-            let result = match configured_windows_ics_repair_request(true).await {
-                Ok(None) => Ok(None),
-                Ok(Some(_)) => match wait_for_mihomo_controller_ready().await {
-                    // Re-read the configuration after waiting so a setting
-                    // changed during startup cannot trigger a stale repair.
-                    Ok(()) => repair_configured_windows_ics(true).await,
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            };
+            // Wait for a real quiet period after the latest trigger. The
+            // service config endpoint is idempotent and schedules recovery
+            // itself; the mutating repair endpoint is never retried here.
+            let observed_generation = WINDOWS_ICS_AUTO_RECOVERY_GENERATION.load(Ordering::Acquire);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if WINDOWS_ICS_AUTO_RECOVERY_GENERATION.load(Ordering::Acquire) != observed_generation {
+                continue;
+            }
+
+            let result = configure_committed_windows_ics_recovery_with_retry().await;
 
             match result {
-                Ok(Some(result)) => logging!(
+                Ok(()) => logging!(
                     info,
                     Type::Service,
-                    "Windows ICS recovery completed; trigger={}, changed={}, rebound={}",
-                    trigger,
-                    result.changed,
-                    result.rebound
+                    "persistent Windows ICS recovery configuration synchronized; trigger={trigger}"
                 ),
-                Ok(None) => logging!(debug, Type::Service, "Windows ICS recovery skipped; trigger={trigger}"),
                 Err(err) => logging!(
                     warn,
                     Type::Service,
-                    "Windows ICS recovery failed; trigger={}: {}",
+                    "Windows ICS recovery configuration sync failed; trigger={}: {}",
                     trigger,
                     err
                 ),
             }
 
-            if WINDOWS_ICS_AUTO_RECOVERY_PENDING.load(Ordering::Acquire) {
+            if WINDOWS_ICS_AUTO_RECOVERY_GENERATION.load(Ordering::Acquire) != observed_generation {
                 continue;
             }
 
             WINDOWS_ICS_AUTO_RECOVERY_RUNNING.store(false, Ordering::Release);
-            if WINDOWS_ICS_AUTO_RECOVERY_PENDING.load(Ordering::Acquire)
+            if WINDOWS_ICS_AUTO_RECOVERY_GENERATION.load(Ordering::Acquire) != observed_generation
                 && !WINDOWS_ICS_AUTO_RECOVERY_RUNNING.swap(true, Ordering::AcqRel)
             {
                 continue;
@@ -917,14 +1496,21 @@ pub fn schedule_windows_ics_recovery(trigger: &'static str) {
     });
 }
 
-fn run_service_command(operation: impl FnOnce() -> Result<()>, label: &'static str) -> Result<()> {
-    tokio::task::block_in_place(operation).with_context(|| format!("{label} failed"))
+async fn run_service_command(
+    operation: impl FnOnce() -> Result<()> + Send + 'static,
+    label: &'static str,
+) -> Result<()> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .with_context(|| format!("{label} task failed"))?
+        .with_context(|| format!("{label} failed"))
 }
 
 pub static SERVICE_MANAGER: Lazy<ServiceManager> = Lazy::new(|| ServiceManager {
     status: Mutex::new(ServiceStatus::Unavailable("Need Checks".into())),
     operation_running: AtomicBool::new(false),
     operation_done: Notify::new(),
+    startup_maintenance_attempted: AtomicBool::new(false),
 });
 
 #[cfg(all(test, target_os = "macos"))]
@@ -982,7 +1568,117 @@ mod tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod windows_ics_tests {
-    use super::build_windows_ics_repair_request;
+    use super::{
+        WindowsIcsRollbackDecision, WindowsScmServiceState, build_windows_ics_repair_request,
+        classify_installed_windows_scm_state, service_status_confirms_running_core, windows_ics_rollback_decision,
+        windows_ics_service_sync_required, windows_scm_state_allows_sidecar,
+    };
+    use windows_sys::Win32::System::Services::SERVICE_STOPPED;
+
+    fn recovery_snapshot(
+        generation: u64,
+        public_guid: &str,
+    ) -> clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot {
+        clash_verge_service_ipc::WindowsIcsRecoveryConfigSnapshot {
+            generation,
+            config: Some(clash_verge_service_ipc::WindowsIcsRecoveryConfig {
+                public_connection: clash_verge_service_ipc::WindowsIcsConnectionSelector {
+                    guid: Some(public_guid.to_owned()),
+                    name: Some("Mihomo".to_owned()),
+                },
+                private_connection: clash_verge_service_ipc::WindowsIcsConnectionSelector {
+                    guid: Some("private-guid".to_owned()),
+                    name: Some("vEthernet (VMs)".to_owned()),
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn only_absent_scm_service_allows_legacy_safe_sidecar_fallback() {
+        assert!(windows_scm_state_allows_sidecar(WindowsScmServiceState::Absent));
+        assert!(!windows_scm_state_allows_sidecar(WindowsScmServiceState::Stopped));
+        assert!(!windows_scm_state_allows_sidecar(WindowsScmServiceState::Active));
+        assert_eq!(
+            classify_installed_windows_scm_state(SERVICE_STOPPED),
+            WindowsScmServiceState::Stopped
+        );
+        assert_eq!(
+            classify_installed_windows_scm_state(SERVICE_STOPPED + 1),
+            WindowsScmServiceState::Active
+        );
+    }
+
+    #[test]
+    fn ambiguous_service_start_requires_running_lifecycle_and_pid() {
+        use clash_verge_service_ipc::ServiceLifecycleState;
+
+        assert!(service_status_confirms_running_core(
+            Some(42),
+            ServiceLifecycleState::Running
+        ));
+        assert!(!service_status_confirms_running_core(
+            None,
+            ServiceLifecycleState::Running
+        ));
+        assert!(!service_status_confirms_running_core(
+            Some(42),
+            ServiceLifecycleState::Fatal
+        ));
+    }
+
+    #[test]
+    fn sidecar_with_existing_ics_requires_service_sync_and_rollback() {
+        assert!(windows_ics_service_sync_required(false, Some(true), None));
+        assert!(windows_ics_service_sync_required(false, Some(true), Some(false)));
+        assert!(!windows_ics_service_sync_required(false, Some(false), None));
+        assert!(windows_ics_service_sync_required(true, Some(false), None));
+    }
+
+    #[test]
+    fn rollback_uses_only_the_exact_generation_applied_by_this_process() {
+        let original = recovery_snapshot(7, "old-public");
+        let applied = recovery_snapshot(8, "new-public");
+
+        assert_eq!(
+            windows_ics_rollback_decision(&original, &applied, Some(&applied)),
+            WindowsIcsRollbackDecision::CompareAndSwap { expected_generation: 8 }
+        );
+    }
+
+    #[test]
+    fn rollback_refuses_to_rebase_over_a_newer_client_target() {
+        let original = recovery_snapshot(7, "old-public");
+        let newer_client = recovery_snapshot(9, "other-client-public");
+
+        assert_eq!(
+            windows_ics_rollback_decision(&original, &newer_client, None),
+            WindowsIcsRollbackDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn older_transaction_receipt_cannot_rollback_a_newer_same_process_mutation() {
+        let original = recovery_snapshot(7, "old-public");
+        let old_transaction_applied = recovery_snapshot(8, "old-transaction-public");
+        let newer_transaction_applied = recovery_snapshot(9, "new-transaction-public");
+
+        assert_eq!(
+            windows_ics_rollback_decision(&original, &newer_transaction_applied, Some(&old_transaction_applied),),
+            WindowsIcsRollbackDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn rollback_is_a_noop_when_the_original_target_is_already_restored() {
+        let original = recovery_snapshot(7, "old-public");
+        let restored_by_another_client = recovery_snapshot(10, "old-public");
+
+        assert_eq!(
+            windows_ics_rollback_decision(&original, &restored_by_another_client, None),
+            WindowsIcsRollbackDecision::AlreadyRestored
+        );
+    }
 
     #[test]
     fn automatic_ics_repair_requires_both_switches() -> anyhow::Result<()> {

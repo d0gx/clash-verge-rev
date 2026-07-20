@@ -2,16 +2,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 
+#[cfg(not(target_os = "windows"))]
+use crate::core::service::{SERVICE_MANAGER, is_service_ipc_path_exists};
 use crate::{
     config::Config,
     core::{
-        CoreManager, Timer,
-        handle::Handle,
-        hotkey::Hotkey,
-        logger::Logger,
-        service::{SERVICE_MANAGER, ServiceManager, is_service_ipc_path_exists},
-        sysopt,
-        tray::Tray,
+        CoreManager, Timer, handle::Handle, hotkey::Hotkey, logger::Logger, service::ServiceManager, sysopt, tray::Tray,
     },
     feat,
     module::{auto_backup::AutoBackupManager, lightweight::auto_lightweight_boot},
@@ -190,6 +186,11 @@ pub(super) async fn init_verge_config_before_window() -> bool {
 
 pub(super) async fn init_service_manager() {
     clash_verge_service_ipc::set_config(Some(ServiceManager::config())).await;
+
+    #[cfg(target_os = "windows")]
+    crate::core::service::schedule_startup_service_maintenance();
+
+    #[cfg(not(target_os = "windows"))]
     if is_service_ipc_path_exists() && SERVICE_MANAGER.init().await.is_ok() {
         logging_error!(Type::Setup, SERVICE_MANAGER.refresh().await);
     }

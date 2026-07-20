@@ -1,10 +1,7 @@
-use crate::{
-    config::profiles,
-    utils::{
-        dirs, help,
-        network::{NetworkManager, ProxyType},
-        tmpl,
-    },
+use crate::utils::{
+    dirs, help,
+    network::{NetworkManager, ProxyType},
+    tmpl,
 };
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -178,7 +175,7 @@ impl PrfItem {
                 let name = item.name.clone().unwrap_or_else(|| "Local File".into());
                 let desc = item.desc.clone().unwrap_or_else(|| "".into());
                 let option = item.option.as_ref();
-                Self::from_local(name, desc, file_data, option).await
+                Self::from_local(name, desc, file_data, option)
             }
             typ => bail!("invalid profile item type \"{typ}\""),
         }
@@ -186,7 +183,7 @@ impl PrfItem {
 
     /// ## Local type
     /// create a new item from name/desc
-    pub async fn from_local(
+    pub fn from_local(
         name: String,
         desc: String,
         file_data: Option<String>,
@@ -196,37 +193,11 @@ impl PrfItem {
         let file = format!("{uid}.yaml").into();
         let opt_ref = option.as_ref();
         let update_interval = opt_ref.and_then(|o| o.update_interval);
-        let mut merge = opt_ref.and_then(|o| o.merge.clone());
-        let mut script = opt_ref.and_then(|o| o.script.clone());
-        let mut rules = opt_ref.and_then(|o| o.rules.clone());
-        let mut proxies = opt_ref.and_then(|o| o.proxies.clone());
-        let mut groups = opt_ref.and_then(|o| o.groups.clone());
-
-        if merge.is_none() {
-            let merge_item = &mut Self::from_merge(None)?;
-            profiles::profiles_append_item_safe(merge_item).await?;
-            merge = merge_item.uid.clone();
-        }
-        if script.is_none() {
-            let script_item = &mut Self::from_script(None)?;
-            profiles::profiles_append_item_safe(script_item).await?;
-            script = script_item.uid.clone();
-        }
-        if rules.is_none() {
-            let rules_item = &mut Self::from_rules()?;
-            profiles::profiles_append_item_safe(rules_item).await?;
-            rules = rules_item.uid.clone();
-        }
-        if proxies.is_none() {
-            let proxies_item = &mut Self::from_proxies()?;
-            profiles::profiles_append_item_safe(proxies_item).await?;
-            proxies = proxies_item.uid.clone();
-        }
-        if groups.is_none() {
-            let groups_item = &mut Self::from_groups()?;
-            profiles::profiles_append_item_safe(groups_item).await?;
-            groups = groups_item.uid.clone();
-        }
+        let merge = opt_ref.and_then(|o| o.merge.clone());
+        let script = opt_ref.and_then(|o| o.script.clone());
+        let rules = opt_ref.and_then(|o| o.rules.clone());
+        let proxies = opt_ref.and_then(|o| o.proxies.clone());
+        let groups = opt_ref.and_then(|o| o.groups.clone());
         Ok(Self {
             uid: Some(uid),
             itype: Some("local".into()),
@@ -266,11 +237,11 @@ impl PrfItem {
         let user_agent = option.and_then(|o| o.user_agent.clone());
         let update_interval = option.and_then(|o| o.update_interval);
         let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
-        let mut merge = option.and_then(|o| o.merge.clone());
-        let mut script = option.and_then(|o| o.script.clone());
-        let mut rules = option.and_then(|o| o.rules.clone());
-        let mut proxies = option.and_then(|o| o.proxies.clone());
-        let mut groups = option.and_then(|o| o.groups.clone());
+        let merge = option.and_then(|o| o.merge.clone());
+        let script = option.and_then(|o| o.script.clone());
+        let rules = option.and_then(|o| o.rules.clone());
+        let proxies = option.and_then(|o| o.proxies.clone());
+        let groups = option.and_then(|o| o.groups.clone());
 
         // 选择代理类型
         let proxy_type = if self_proxy {
@@ -391,32 +362,6 @@ impl PrfItem {
             bail!("profile does not contain `proxies` or `proxy-providers`");
         }
 
-        if merge.is_none() {
-            let merge_item = &mut Self::from_merge(None)?;
-            profiles::profiles_append_item_safe(merge_item).await?;
-            merge = merge_item.uid.clone();
-        }
-        if script.is_none() {
-            let script_item = &mut Self::from_script(None)?;
-            profiles::profiles_append_item_safe(script_item).await?;
-            script = script_item.uid.clone();
-        }
-        if rules.is_none() {
-            let rules_item = &mut Self::from_rules()?;
-            profiles::profiles_append_item_safe(rules_item).await?;
-            rules = rules_item.uid.clone();
-        }
-        if proxies.is_none() {
-            let proxies_item = &mut Self::from_proxies()?;
-            profiles::profiles_append_item_safe(proxies_item).await?;
-            proxies = proxies_item.uid.clone();
-        }
-        if groups.is_none() {
-            let groups_item = &mut Self::from_groups()?;
-            profiles::profiles_append_item_safe(groups_item).await?;
-            groups = groups_item.uid.clone();
-        }
-
         Ok(Self {
             uid: Some(uid),
             itype: Some("remote".into()),
@@ -440,6 +385,47 @@ impl PrfItem {
             updated: Some(chrono::Local::now().timestamp() as usize),
             file_data: Some(data.into()),
         })
+    }
+
+    /// Materialize the auxiliary profiles referenced by a local or remote
+    /// profile without touching global configuration.  Callers append the
+    /// returned items and the primary item together while holding the global
+    /// configuration transaction gate.
+    pub(crate) fn materialize_missing_auxiliary_profiles(&mut self) -> Result<Vec<Self>> {
+        if !matches!(self.itype.as_deref(), Some("local" | "remote")) {
+            return Ok(Vec::new());
+        }
+
+        let option = self.option.get_or_insert_with(PrfOption::default);
+        let mut auxiliary = Vec::new();
+
+        if option.merge.is_none() {
+            let item = Self::from_merge(None)?;
+            option.merge = item.uid.clone();
+            auxiliary.push(item);
+        }
+        if option.script.is_none() {
+            let item = Self::from_script(None)?;
+            option.script = item.uid.clone();
+            auxiliary.push(item);
+        }
+        if option.rules.is_none() {
+            let item = Self::from_rules()?;
+            option.rules = item.uid.clone();
+            auxiliary.push(item);
+        }
+        if option.proxies.is_none() {
+            let item = Self::from_proxies()?;
+            option.proxies = item.uid.clone();
+            auxiliary.push(item);
+        }
+        if option.groups.is_none() {
+            let item = Self::from_groups()?;
+            option.groups = item.uid.clone();
+            auxiliary.push(item);
+        }
+
+        Ok(auxiliary)
     }
 
     /// ## Merge type (enhance)
@@ -620,7 +606,7 @@ fn fix_dirty_url(input: &str) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrfOption, allow_auto_update_enabled};
+    use super::{PrfItem, PrfOption, allow_auto_update_enabled};
 
     #[test]
     fn auto_update_defaults_to_enabled_and_preserves_explicit_false() {
@@ -631,5 +617,24 @@ mod tests {
             ..PrfOption::default()
         };
         assert!(!allow_auto_update_enabled(Some(&disabled)));
+    }
+
+    #[test]
+    fn auxiliary_profiles_are_materialized_without_global_config_mutation() -> anyhow::Result<()> {
+        let mut item = PrfItem {
+            itype: Some("remote".into()),
+            option: Some(PrfOption::default()),
+            ..PrfItem::default()
+        };
+
+        let auxiliary = item.materialize_missing_auxiliary_profiles()?;
+        assert_eq!(auxiliary.len(), 5);
+        assert!(item.current_merge().is_some());
+        assert!(item.current_script().is_some());
+        assert!(item.current_rules().is_some());
+        assert!(item.current_proxies().is_some());
+        assert!(item.current_groups().is_some());
+        assert!(item.materialize_missing_auxiliary_profiles()?.is_empty());
+        Ok(())
     }
 }

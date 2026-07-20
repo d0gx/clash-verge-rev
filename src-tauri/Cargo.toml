@@ -101,7 +101,7 @@ clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-log
 async-trait = "0.1.89"
 clash_verge_service_ipc = { version = "=2.3.4-ics.1", features = [
   "client",
-], git = "https://github.com/d0gx/clash-verge-service-ipc", rev = "fac44319ac1f9056f2c381bb2bf5defe7cf61e14" }
+], git = "https://github.com/d0gx/clash-verge-service-ipc", rev = "81136f1ad3f8e0d604919db919068e7148770062" }
 arc-swap = "1.9.2"
 tokio-rustls = "0.26.4"
 rustls = { version = "0.23.41", features = ["ring"] }

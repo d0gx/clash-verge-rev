@@ -30,6 +30,12 @@ pub mod timing {
     pub const SERVICE_WAIT_MAX: Duration = Duration::from_millis(30000);
     #[cfg(target_os = "windows")]
     pub const SERVICE_WAIT_INTERVAL: Duration = Duration::from_millis(200);
+    // Every Windows startup performs a short ownership handshake, even when
+    // TUN is disabled or the app is elevated. This catches a cold service
+    // before a competing sidecar is spawned without imposing the full TUN
+    // wait on machines that do not have the service installed.
+    #[cfg(target_os = "windows")]
+    pub const SERVICE_OWNERSHIP_PROBE_MAX: Duration = Duration::from_secs(2);
 
     // 回退 sidecar 后继续等待服务就绪并尝试交接。
     #[cfg(target_os = "windows")]
@@ -42,6 +48,8 @@ pub mod timing {
     pub const SERVICE_START_RETRIES: usize = 5;
     #[cfg(target_os = "windows")]
     pub const SERVICE_START_RETRY_DELAY: Duration = Duration::from_millis(300);
+    #[cfg(target_os = "windows")]
+    pub const SIDECAR_STOP_WAIT_MAX: Duration = Duration::from_secs(5);
 }
 
 pub mod files {

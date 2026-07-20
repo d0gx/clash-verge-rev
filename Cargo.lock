@@ -1210,7 +1210,7 @@ dependencies = [
 [[package]]
 name = "clash_verge_service_ipc"
 version = "2.3.4-ics.1"
-source = "git+https://github.com/d0gx/clash-verge-service-ipc?rev=fac44319ac1f9056f2c381bb2bf5defe7cf61e14#fac44319ac1f9056f2c381bb2bf5defe7cf61e14"
+source = "git+https://github.com/d0gx/clash-verge-service-ipc?rev=81136f1ad3f8e0d604919db919068e7148770062#81136f1ad3f8e0d604919db919068e7148770062"
 dependencies = [
  "anyhow",
  "compact_str",
@@ -1222,6 +1222,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tokio",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -161,6 +161,7 @@ mod app_init {
             cmd::repair_windows_ics,
             cmd::get_clash_info,
             cmd::patch_clash_config,
+            cmd::patch_windows_tun_and_ics_config,
             cmd::patch_clash_mode,
             cmd::get_clash_mode,
             cmd::change_clash_core,

@@ -24,7 +24,7 @@ pub async fn delete_local_backup(filename: String) -> CmdResult<()> {
 /// Restore local backup
 #[tauri::command]
 pub async fn restore_local_backup(filename: String) -> CmdResult<()> {
-    feat::restore_local_backup(filename).await.stringify_err()
+    Box::pin(feat::restore_local_backup(filename)).await.stringify_err()
 }
 
 /// Import local backup into the app's backup directory

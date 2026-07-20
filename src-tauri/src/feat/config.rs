@@ -11,44 +11,112 @@ use clash_verge_draft::SharedDraft;
 use clash_verge_logging::{Type, logging, logging_error};
 use serde_yaml_ng::Mapping;
 
+#[cfg(target_os = "windows")]
+use crate::core::manager::RunningMode;
+
 /// Patch Clash configuration
 pub async fn patch_clash(patch: &Mapping) -> Result<()> {
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
+    let clash_before = (**Config::clash().await.data_arc()).clone();
+    #[cfg(target_os = "windows")]
+    let verge_before = (**Config::verge().await.data_arc()).clone();
+    let runtime_before = (**Config::runtime().await.data_arc()).clone();
+    #[cfg(target_os = "windows")]
+    let service_sync_may_have_occurred = service::windows_ics_service_sync_required(
+        matches!(*manager.get_running_mode(), RunningMode::Service),
+        verge_before.enable_windows_ics_recovery,
+        verge_before.enable_windows_ics_recovery,
+    );
+    #[cfg(target_os = "windows")]
+    let service_before = if service_sync_may_have_occurred {
+        Some(service::snapshot_windows_ics_recovery().await?)
+    } else {
+        None
+    };
     Config::clash().await.edit_draft(|d| d.patch_config(patch));
 
-    let res = {
+    let res: Result<()> = async {
         // 激活订阅
         if patch.get("secret").is_some() || patch.get("external-controller").is_some() {
             Config::generate().await?;
-            CoreManager::global().restart_core().await?;
+            manager.restart_core_in_transaction().await?;
         } else if patch.get("allow-lan").is_some() {
-            CoreManager::global().update_config_checked().await?;
+            manager.update_config_checked_in_transaction().await?;
         } else {
             if patch.get("mode").is_some() {
                 tray::Tray::global().update_menu_and_icon().await;
             }
             Config::runtime().await.edit_draft(|d| d.patch_config(patch));
-            CoreManager::global().update_config_checked().await?;
+            manager.update_config_checked_in_transaction().await?;
         }
         handle::Handle::refresh_clash();
+        Config::clash().await.latest_arc().save_config().await?;
         <Result<()>>::Ok(())
-    };
+    }
+    .await;
     match res {
         Ok(()) => {
             Config::clash().await.apply();
-            // 分离数据获取和异步调用
-            let clash_data = Config::clash().await.data_arc();
-            clash_data.save_config().await?;
-            #[cfg(target_os = "windows")]
-            if patch.get("tun").is_some() && Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false) {
-                service::schedule_windows_ics_recovery("tun-config-changed");
-            }
             Ok(())
         }
         Err(err) => {
-            Config::clash().await.discard();
-            Err(err)
+            let clash = Config::clash().await;
+            clash.edit_draft(|draft| *draft = clash_before.clone());
+            clash.apply();
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback_error) = manager.restore_runtime_in_transaction(&runtime_before).await {
+                rollback_errors.push(format!("runtime rollback failed: {rollback_error:#}"));
+            }
+            #[cfg(target_os = "windows")]
+            if service_sync_may_have_occurred
+                && let Some(snapshot) = service_before.as_ref()
+                && let Err(rollback_error) = service::restore_windows_ics_recovery_snapshot(snapshot).await
+            {
+                rollback_errors.push(format!("service rollback failed: {rollback_error:#}"));
+            }
+            if let Err(rollback_error) = clash_before.save_config().await {
+                rollback_errors.push(format!("clash file rollback failed: {rollback_error:#}"));
+            }
+            if rollback_errors.is_empty() {
+                Err(err)
+            } else {
+                Err(err.context(format!("rollback errors: {}", rollback_errors.join("; "))))
+            }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+pub async fn patch_windows_tun_and_ics(tun: &Mapping, ics: &IVerge) -> Result<()> {
+    let private_guid = ics
+        .windows_ics_private_adapter_guid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let private_name = ics
+        .windows_ics_private_adapter_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if ics.enable_windows_ics_recovery.unwrap_or(false) && private_guid.is_none() && private_name.is_none() {
+        return Err(anyhow::anyhow!("Windows ICS private adapter is not configured"));
+    }
+
+    // Accept only the three fields owned by this dialog. This keeps the new
+    // transaction boundary from becoming a generic IVerge patch backdoor.
+    let ics = IVerge {
+        enable_windows_ics_recovery: ics.enable_windows_ics_recovery,
+        windows_ics_private_adapter_guid: ics.windows_ics_private_adapter_guid.clone(),
+        windows_ics_private_adapter_name: ics.windows_ics_private_adapter_name.clone(),
+        ..IVerge::default()
+    };
+
+    CoreManager::global().patch_windows_tun_and_ics(tun, &ics).await?;
+    handle::Handle::refresh_clash();
+    handle::Handle::refresh_verge();
+    logging_error!(Type::Backup, AutoBackupManager::global().refresh_settings().await);
+    Ok(())
 }
 
 // Define update flags as bitflags for better performance
@@ -207,14 +275,14 @@ fn determine_update_flags(patch: &IVerge) -> UpdateFlags {
 }
 
 #[allow(clippy::cognitive_complexity)]
-async fn process_terminated_flags(update_flags: UpdateFlags, patch: &IVerge) -> Result<()> {
+async fn process_terminated_flags(manager: &CoreManager, update_flags: UpdateFlags, patch: &IVerge) -> Result<()> {
     // Process updates based on flags
     if update_flags.contains(UpdateFlags::RESTART_CORE) {
         Config::generate().await?;
-        CoreManager::global().restart_core().await?;
+        manager.restart_core_in_transaction().await?;
     }
     if update_flags.contains(UpdateFlags::CLASH_CONFIG) {
-        CoreManager::global().update_config_checked().await?;
+        manager.update_config_checked_in_transaction().await?;
         handle::Handle::refresh_clash();
     }
     if update_flags.contains(UpdateFlags::VERGE_CONFIG) {
@@ -273,31 +341,142 @@ async fn process_terminated_flags(update_flags: UpdateFlags, patch: &IVerge) -> 
     Ok(())
 }
 
+fn non_runtime_side_effect_flags(update_flags: UpdateFlags) -> UpdateFlags {
+    update_flags.difference(UpdateFlags::RESTART_CORE | UpdateFlags::CLASH_CONFIG)
+}
+
+async fn restore_non_runtime_side_effects(
+    manager: &CoreManager,
+    update_flags: UpdateFlags,
+    verge_before: &IVerge,
+) -> Vec<std::string::String> {
+    let rollback_flags = non_runtime_side_effect_flags(update_flags);
+    let mut rollback_patch = verge_before.clone();
+
+    // `None` is a valid legacy value, but restoring it still has to undo a
+    // newly registered hotkey set / locale / macOS tray-speed task.
+    if rollback_flags.contains(UpdateFlags::HOTKEY) && rollback_patch.hotkeys.is_none() {
+        rollback_patch.hotkeys = Some(Vec::new());
+    }
+    if rollback_flags.contains(UpdateFlags::LANGUAGE) && rollback_patch.language.is_none() {
+        rollback_patch.language = Some(clash_verge_i18n::system_language().into());
+    }
+    #[cfg(target_os = "macos")]
+    if rollback_flags.contains(UpdateFlags::SYSTRAY_ICON) && rollback_patch.enable_tray_speed.is_none() {
+        rollback_patch.enable_tray_speed = Some(false);
+    }
+
+    let ordered_flags = [
+        UpdateFlags::VERGE_CONFIG,
+        UpdateFlags::LAUNCH,
+        UpdateFlags::LANGUAGE,
+        UpdateFlags::SYS_PROXY,
+        UpdateFlags::HOTKEY,
+        UpdateFlags::SYSTRAY_MENU,
+        UpdateFlags::SYSTRAY_ICON,
+        UpdateFlags::SYSTRAY_TOOLTIP,
+        UpdateFlags::SYSTRAY_CLICK_BEHAVIOR,
+        UpdateFlags::LIGHT_WEIGHT,
+        UpdateFlags::LOG_LEVEL,
+        UpdateFlags::LOG_FILE,
+    ];
+    let mut errors = Vec::new();
+    for flag in ordered_flags {
+        if rollback_flags.contains(flag)
+            && let Err(error) = process_terminated_flags(manager, flag, &rollback_patch).await
+        {
+            errors.push(format!("{flag:?} side-effect rollback failed: {error:#}"));
+        }
+    }
+    errors
+}
+
 pub async fn patch_verge(patch: &IVerge, not_save_file: bool) -> Result<()> {
-    Config::verge().await.edit_draft(|d| d.patch_config(patch));
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
+    patch_verge_in_transaction(manager, patch, not_save_file).await
+}
+
+pub(crate) async fn patch_verge_in_transaction(
+    manager: &CoreManager,
+    patch: &IVerge,
+    not_save_file: bool,
+) -> Result<()> {
+    let verge_before = (**Config::verge().await.data_arc()).clone();
+    let runtime_before = (**Config::runtime().await.data_arc()).clone();
 
     let update_flags = determine_update_flags(patch);
-    logging!(debug, Type::Setup, "Determined update flags: {:?}", update_flags);
-    let process_flag_result: std::result::Result<(), anyhow::Error> = {
-        process_terminated_flags(update_flags, patch).await?;
-        Ok(())
-    };
-
-    if let Err(err) = process_flag_result {
-        Config::verge().await.discard();
-        return Err(err);
-    }
-    Config::verge().await.apply();
-    logging_error!(Type::Backup, AutoBackupManager::global().refresh_settings().await);
-    if !not_save_file {
-        // 分离数据获取和异步调用
-        let verge_data = Config::verge().await.data_arc();
-        logging!(debug, Type::Setup, "Saving Verge configuration to file...");
-        verge_data.save_file().await?;
-    }
+    let runtime_may_change = update_flags.intersects(UpdateFlags::RESTART_CORE | UpdateFlags::CLASH_CONFIG);
     #[cfg(target_os = "windows")]
-    if patch.enable_tun_mode == Some(true)
-        || patch.enable_windows_ics_recovery == Some(true)
+    let ics_fields_changed = patch.enable_windows_ics_recovery.is_some()
+        || patch.windows_ics_private_adapter_guid.is_some()
+        || patch.windows_ics_private_adapter_name.is_some();
+    #[cfg(target_os = "windows")]
+    let service_sync_required = service::windows_ics_service_sync_required(
+        matches!(*manager.get_running_mode(), RunningMode::Service),
+        verge_before.enable_windows_ics_recovery,
+        patch.enable_windows_ics_recovery,
+    );
+    #[cfg(target_os = "windows")]
+    let explicit_ics_sync_required = ics_fields_changed && service_sync_required;
+    #[cfg(target_os = "windows")]
+    let service_sync_may_have_occurred = (runtime_may_change && service_sync_required) || explicit_ics_sync_required;
+    #[cfg(target_os = "windows")]
+    let service_before = if service_sync_may_have_occurred {
+        Some(service::snapshot_windows_ics_recovery().await?)
+    } else {
+        None
+    };
+    Config::verge().await.edit_draft(|d| d.patch_config(patch));
+    logging!(debug, Type::Setup, "Determined update flags: {:?}", update_flags);
+    let transaction_result: Result<()> = async {
+        process_terminated_flags(manager, update_flags, patch).await?;
+        #[cfg(target_os = "windows")]
+        if explicit_ics_sync_required {
+            let verge_current = Config::verge().await.latest_arc();
+            let runtime_current = Config::runtime().await.data_arc();
+            service::configure_windows_ics_recovery_for_config(&verge_current, &runtime_current).await?;
+        }
+        if !not_save_file {
+            logging!(debug, Type::Setup, "Saving Verge configuration to file...");
+            Config::verge().await.latest_arc().save_file().await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = transaction_result {
+        let verge = Config::verge().await;
+        verge.edit_draft(|draft| *draft = verge_before.clone());
+        verge.apply();
+        let mut rollback_errors = Vec::new();
+        if runtime_may_change && let Err(rollback_error) = manager.restore_runtime_in_transaction(&runtime_before).await
+        {
+            rollback_errors.push(format!("runtime rollback failed: {rollback_error:#}"));
+        }
+        #[cfg(target_os = "windows")]
+        if service_sync_may_have_occurred
+            && let Some(snapshot) = service_before.as_ref()
+            && let Err(rollback_error) = service::restore_windows_ics_recovery_snapshot(snapshot).await
+        {
+            rollback_errors.push(format!("service rollback failed: {rollback_error:#}"));
+        }
+        if !not_save_file && let Err(rollback_error) = verge_before.save_file().await {
+            rollback_errors.push(format!("verge file rollback failed: {rollback_error:#}"));
+        }
+        rollback_errors.extend(restore_non_runtime_side_effects(manager, update_flags, &verge_before).await);
+        return if rollback_errors.is_empty() {
+            Err(err)
+        } else {
+            Err(err.context(format!("rollback errors: {}", rollback_errors.join("; "))))
+        };
+    }
+    let verge = Config::verge().await;
+    verge.apply();
+    logging_error!(Type::Backup, AutoBackupManager::global().refresh_settings().await);
+    #[cfg(target_os = "windows")]
+    if patch.enable_tun_mode.is_some()
+        || patch.enable_windows_ics_recovery.is_some()
         || patch.windows_ics_private_adapter_guid.is_some()
         || patch.windows_ics_private_adapter_name.is_some()
     {
@@ -310,4 +489,25 @@ pub async fn fetch_verge_config() -> Result<SharedDraft<IVerge>> {
     let draft = Config::verge().await;
     let data = draft.data_arc();
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpdateFlags, non_runtime_side_effect_flags};
+
+    #[test]
+    fn verge_rollback_replays_every_non_runtime_side_effect_only() {
+        let all = UpdateFlags::all();
+        let rollback = non_runtime_side_effect_flags(all);
+
+        assert!(!rollback.intersects(UpdateFlags::RESTART_CORE | UpdateFlags::CLASH_CONFIG));
+        assert!(rollback.contains(UpdateFlags::LAUNCH));
+        assert!(rollback.contains(UpdateFlags::SYS_PROXY));
+        assert!(rollback.contains(UpdateFlags::LANGUAGE));
+        assert!(rollback.contains(UpdateFlags::HOTKEY));
+        assert!(rollback.contains(UpdateFlags::GROUP_SYS_TRAY));
+        assert!(rollback.contains(UpdateFlags::SYSTRAY_CLICK_BEHAVIOR));
+        assert!(rollback.contains(UpdateFlags::LIGHT_WEIGHT));
+        assert!(rollback.contains(UpdateFlags::LOG_LEVEL | UpdateFlags::LOG_FILE));
+    }
 }

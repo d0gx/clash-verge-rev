@@ -2,7 +2,7 @@ use super::CmdResult;
 use crate::{
     cmd::StringifyErr as _,
     cmd::validate::{ValidationNoticeTarget, handle_validation_notice},
-    config::{Config, IProfiles, PrfItem},
+    config::{Config, IProfiles, PrfItem, profiles::begin_profile_mutation},
     core::{
         CoreManager, handle,
         validate::{CoreConfigValidator, ValidationOutcome},
@@ -21,6 +21,11 @@ pub async fn save_profile_file(index: String, file_data: Option<String>) -> CmdR
         Some(d) => d,
         None => return Ok(ValidationOutcome::Valid),
     };
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
+    // Invalidate older downloads before touching this UID's file and retain
+    // the same gate through validation/apply/rollback.
+    let _profile_revision = begin_profile_mutation(&index).await;
 
     let backup_trigger = match index.as_str() {
         "Merge" => Some(AutoBackupTrigger::GlobalMerge),
@@ -178,7 +183,12 @@ async fn handle_saved_profile_file(
         Type::Config,
         "[cmd配置save] 保存项影响当前运行时配置，开始统一应用"
     );
-    match CoreManager::global().update_config_forced().await {
+    // The command owns config_transaction_lock across file write, validation,
+    // apply, and rollback; use the non-locking inner manager entrypoint here.
+    match CoreManager::global()
+        .update_config_with_force_in_transaction(true)
+        .await
+    {
         Ok(outcome) if outcome.is_valid() => {
             handle::Handle::refresh_clash();
             Ok(ValidationOutcome::Valid)

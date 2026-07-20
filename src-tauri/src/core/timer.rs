@@ -386,23 +386,23 @@ impl Timer {
         let task_start = std::time::Instant::now();
         logging!(debug, Type::Timer, "Running timer task for profile: {}", uid);
 
-        match tokio::time::timeout(std::time::Duration::from_secs(40), async {
-            Self::emit_update_event(uid, true);
+        Self::emit_update_event(uid, true);
 
-            let is_current = Config::profiles().await.latest_arc().current.as_ref() == Some(uid);
-            logging!(
-                debug,
-                Type::Timer,
-                "Profile {} is current active profile: {}",
-                uid,
-                is_current
-            );
+        let is_current = Config::profiles().await.latest_arc().current.as_ref() == Some(uid);
+        logging!(
+            debug,
+            Type::Timer,
+            "Profile {} is current active profile: {}",
+            uid,
+            is_current
+        );
 
-            feat::update_profile(uid, None, is_current, false, false).await
-        })
-        .await
-        {
-            Ok(Ok(_)) => {
+        // Network requests carry their own timeouts. Once update_profile enters
+        // the configuration transaction, let its file/runtime/service mutation
+        // complete or roll back instead of cancelling it at an arbitrary wall
+        // clock boundary.
+        match feat::update_profile(uid, None, is_current, false, false).await {
+            Ok(_) => {
                 logging!(
                     info,
                     Type::Timer,
@@ -411,8 +411,7 @@ impl Timer {
                     task_start.elapsed().as_millis()
                 );
             }
-            Ok(Err(e)) => logging_error!(Type::Timer, "Failed to update profile uid {}: {}", uid, e),
-            Err(_) => logging_error!(Type::Timer, "Timer task timed out for uid: {}", uid),
+            Err(e) => logging_error!(Type::Timer, "Failed to update profile uid {}: {}", uid, e),
         }
 
         Self::emit_update_event(uid, false);

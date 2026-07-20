@@ -84,6 +84,15 @@ fn after_change_clash_mode() {
 /// mihomo `/configs` PATCH 失败时返回 `Err`，以便命令层把失败上抛给前端。
 /// （此前该函数吞掉错误并始终视为成功，导致 UI 误判"切换成功"、看似"切不动"。）
 pub async fn change_clash_mode(mode: String) -> Result<(), String> {
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
+    let clash_before = (**Config::clash().await.data_arc()).clone();
+    let previous_mode = clash_before
+        .0
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("rule")
+        .to_owned();
     let mut mapping = Mapping::new();
     mapping.insert(Value::from("mode"), Value::from(mode.as_str()));
     // Convert YAML mapping to JSON Value
@@ -99,14 +108,28 @@ pub async fn change_clash_mode(mode: String) -> Result<(), String> {
     // 更新订阅
     let clash = Config::clash().await;
     clash.edit_draft(|d| d.patch_config(&mapping));
-    clash.apply();
+    if let Err(error) = clash.latest_arc().save_config().await {
+        clash.edit_draft(|draft| *draft = clash_before.clone());
+        clash.apply();
 
-    // 分离数据获取和异步调用
-    let clash_data = clash.data_arc();
-    if clash_data.save_config().await.is_ok() {
-        handle::Handle::refresh_clash();
-        tray::Tray::global().update_menu_and_icon().await;
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = clash_before.save_config().await {
+            rollback_errors.push(format!("clash file rollback failed: {rollback_error:#}"));
+        }
+        let previous_json = serde_json::json!({ "mode": previous_mode });
+        if let Err(rollback_error) = handle::Handle::mihomo().await.patch_base_config(&previous_json).await {
+            rollback_errors.push(format!("mihomo mode rollback failed: {rollback_error}"));
+        }
+
+        return if rollback_errors.is_empty() {
+            Err(error.to_string().into())
+        } else {
+            Err(format!("{error}; rollback errors: {}", rollback_errors.join("; ")).into())
+        };
     }
+    clash.apply();
+    handle::Handle::refresh_clash();
+    tray::Tray::global().update_menu_and_icon().await;
 
     let is_auto_close_connection = Config::verge().await.data_arc().auto_close_connection.unwrap_or(false);
     if is_auto_close_connection {

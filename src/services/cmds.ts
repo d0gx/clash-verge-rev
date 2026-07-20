@@ -121,6 +121,13 @@ export async function patchClashConfig(payload: Partial<IConfigData>) {
   return invoke<void>('patch_clash_config', { payload })
 }
 
+export async function patchWindowsTunAndIcsConfig(
+  tun: IConfigData['tun'],
+  ics: Partial<IVergeConfig>,
+) {
+  return invoke<void>('patch_windows_tun_and_ics_config', { tun, ics })
+}
+
 export async function patchClashMode(payload: string) {
   return invoke<void>('patch_clash_mode', { payload })
 }

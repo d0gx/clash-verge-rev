@@ -3,14 +3,14 @@ use crate::feat;
 use crate::utils::{dirs, yaml_emitter};
 use crate::{
     cmd::StringifyErr as _,
-    config::{ClashInfo, Config},
+    config::{ClashInfo, Config, IVerge},
     constants,
     core::{
         CoreManager, handle,
         validate::{CoreConfigValidator, ValidationOutcome},
     },
 };
-use clash_verge_logging::{Type, logging, logging_error};
+use clash_verge_logging::{Type, logging};
 use compact_str::CompactString;
 use serde_yaml_ng::Mapping;
 use smartstring::alias::String;
@@ -33,6 +33,21 @@ pub async fn get_clash_info() -> CmdResult<ClashInfo> {
 #[tauri::command]
 pub async fn patch_clash_config(payload: Mapping) -> CmdResult {
     feat::patch_clash(&payload).await.stringify_err()
+}
+
+/// Atomically apply the Windows TUN mapping and its ICS recovery target.
+#[tauri::command]
+pub async fn patch_windows_tun_and_ics_config(tun: Mapping, ics: IVerge) -> CmdResult {
+    #[cfg(target_os = "windows")]
+    {
+        feat::patch_windows_tun_and_ics(&tun, &ics).await.stringify_err()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (tun, ics);
+        Err("Windows TUN and ICS settings are only available on Windows".into())
+    }
 }
 
 /// 修改Clash模式
@@ -60,8 +75,6 @@ pub async fn change_clash_core(clash_core: String) -> CmdResult<Option<String>> 
 
     match CoreManager::global().change_core(&clash_core).await {
         Ok(_) => {
-            logging_error!(Type::Core, Config::profiles().await.data_arc().save_file().await);
-
             // 切换内核后重启内核
             match CoreManager::global().restart_core().await {
                 Ok(_) => {
@@ -100,7 +113,6 @@ pub async fn start_core() -> CmdResult {
 /// 关闭核心
 #[tauri::command]
 pub async fn stop_core() -> CmdResult {
-    logging_error!(Type::Core, Config::profiles().await.data_arc().save_file().await);
     let result = CoreManager::global().stop_core().await.stringify_err();
     if result.is_ok() {
         handle::Handle::refresh_clash();
@@ -111,7 +123,6 @@ pub async fn stop_core() -> CmdResult {
 /// 重启核心
 #[tauri::command]
 pub async fn restart_core() -> CmdResult {
-    logging_error!(Type::Core, Config::profiles().await.data_arc().save_file().await);
     let result = CoreManager::global().restart_core().await.stringify_err();
     if result.is_ok() {
         handle::Handle::refresh_clash();
@@ -176,19 +187,19 @@ pub async fn apply_dns_config(apply: bool) -> CmdResult {
         let mut patch = serde_yaml_ng::Mapping::new();
         patch.insert("dns".into(), patch_config.into());
 
-        // 应用DNS配置到运行时配置
-        Config::runtime().await.edit_draft(|d| {
-            d.patch_config(&patch);
-        });
-
-        // 应用新配置
-        CoreManager::global()
-            .update_config_checked()
+        // Edit and apply under the same transaction gate; otherwise an atomic
+        // TUN rollback could discard this draft before the manager acquires
+        // its update guard.
+        let outcome = CoreManager::global()
+            .update_runtime_config(|d| d.patch_config(&patch))
             .await
             .stringify_err_log(|err| {
                 let err = format!("Failed to apply config with DNS: {err}");
                 logging!(error, Type::Config, "{err}");
             })?;
+        if !outcome.is_valid() {
+            return Err(format!("Failed to apply config with DNS: {outcome}").into());
+        }
 
         logging!(info, Type::Config, "DNS config successfully applied");
     } else {

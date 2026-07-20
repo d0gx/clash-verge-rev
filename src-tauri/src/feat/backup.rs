@@ -1,6 +1,9 @@
 use crate::{
-    config::{Config, IClashTemp, IProfiles, IVerge},
-    core::backup,
+    config::{
+        Config, IClashTemp, IProfiles, IVerge,
+        profiles::{ProfileBulkMutationGuard, begin_profile_bulk_mutation},
+    },
+    core::{CoreManager, backup},
     process::AsyncHandler,
     utils::{
         dirs::{PathBufExec as _, app_home_dir, local_backup_dir, verge_path},
@@ -24,9 +27,23 @@ pub struct LocalBackupFile {
     pub content_length: u64,
 }
 
+async fn begin_profile_restore() -> ProfileBulkMutationGuard {
+    let uids = Config::profiles()
+        .await
+        .latest_arc()
+        .items
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| item.uid.clone())
+        .collect();
+    begin_profile_bulk_mutation(uids).await
+}
+
 /// Load restored verge.yaml from disk, merge back WebDAV creds, save, and sync memory.
 /// Also reload other restored configs so restarts won't overwrite them.
-async fn finalize_restored_verge_config(
+async fn finalize_restored_verge_config_in_transaction(
+    manager: &CoreManager,
     webdav_url: Option<String>,
     webdav_username: Option<String>,
     webdav_password: Option<String>,
@@ -61,7 +78,7 @@ async fn finalize_restored_verge_config(
 
     // Ensure side-effects (flags, tray, sysproxy, hotkeys, auto-backup refresh, etc.) run.
     // Use not_save_file = true to avoid extra I/O (we already persisted the restored file).
-    if let Err(err) = super::patch_verge(&restored, true).await {
+    if let Err(err) = super::patch_verge_in_transaction(manager, &restored, true).await {
         logging!(error, Type::Backup, "Failed to apply restored verge config: {err:#?}");
     }
     Ok(())
@@ -109,12 +126,6 @@ pub async fn delete_webdav_backup(filename: String) -> Result<()> {
 
 /// Restore WebDAV backup
 pub async fn restore_webdav_backup(filename: String) -> Result<()> {
-    let verge = Config::verge().await;
-    let verge_data = verge.latest_arc();
-    let webdav_url = verge_data.webdav_url.clone();
-    let webdav_username = verge_data.webdav_username.clone();
-    let webdav_password = verge_data.webdav_password.clone();
-
     let backup_storage_path = app_home_dir()
         .map_err(|e| anyhow::anyhow!("Failed to get app home dir: {e}"))?
         .join(filename.as_str());
@@ -126,12 +137,30 @@ pub async fn restore_webdav_backup(filename: String) -> Result<()> {
             err
         })?;
 
-    // extract zip file
-    let value = backup_storage_path.clone();
-    let file = AsyncHandler::spawn_blocking(move || std::fs::File::open(&value)).await??;
-    let mut zip = zip::ZipArchive::new(file)?;
-    zip.extract(app_home_dir()?)?;
-    let res = finalize_restored_verge_config(webdav_url, webdav_username, webdav_password).await;
+    let res = async {
+        let manager = CoreManager::global();
+        let _transaction = manager.begin_config_transaction().await;
+        let _profile_restore = begin_profile_restore().await;
+        let (webdav_url, webdav_username, webdav_password) = {
+            let verge = Config::verge().await;
+            let verge = verge.latest_arc();
+            (
+                verge.webdav_url.clone(),
+                verge.webdav_username.clone(),
+                verge.webdav_password.clone(),
+            )
+        };
+
+        // Extraction overwrites live configuration files. Keep it in the same
+        // transaction as reload/apply so no concurrent draft can observe or
+        // overwrite a partially restored set.
+        let value = backup_storage_path.clone();
+        let file = AsyncHandler::spawn_blocking(move || std::fs::File::open(&value)).await??;
+        let mut zip = zip::ZipArchive::new(file)?;
+        zip.extract(app_home_dir()?)?;
+        finalize_restored_verge_config_in_transaction(manager, webdav_url, webdav_username, webdav_password).await
+    }
+    .await;
     // Finally remove the temp file (attempt cleanup even if finalize fails)
     let _ = backup_storage_path.remove_if_exists().await;
     res
@@ -301,6 +330,9 @@ pub async fn restore_local_backup(filename: String) -> Result<()> {
         return Err(anyhow!("Backup file not found: {}", filename));
     }
 
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
+    let _profile_restore = begin_profile_restore().await;
     let (webdav_url, webdav_username, webdav_password) = {
         let verge = Config::verge().await;
         let verge = verge.latest_arc();
@@ -314,7 +346,7 @@ pub async fn restore_local_backup(filename: String) -> Result<()> {
     let file = AsyncHandler::spawn_blocking(move || std::fs::File::open(&target_path)).await??;
     let mut zip = zip::ZipArchive::new(file)?;
     zip.extract(app_home_dir()?)?;
-    finalize_restored_verge_config(webdav_url, webdav_username, webdav_password).await?;
+    finalize_restored_verge_config_in_transaction(manager, webdav_url, webdav_username, webdav_password).await?;
     Ok(())
 }
 

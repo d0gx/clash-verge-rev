@@ -21,7 +21,6 @@ use clash_verge_logging::{Type, logging, logging_error};
 use scopeguard::defer;
 use smartstring::alias::String;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 static CURRENT_SWITCHING_PROFILE: AtomicBool = AtomicBool::new(false);
 
@@ -83,6 +82,7 @@ pub async fn import_profile(url: std::string::String, option: Option<PrfOption>)
         }
     };
 
+    let _transaction = CoreManager::global().begin_config_transaction().await;
     if let Err(e) = profiles_append_item_safe(item).await {
         logging!(error, Type::Cmd, "[导入订阅] 保存配置失败: {}", e);
         return Err(format!("导入订阅失败: {}", e).into());
@@ -107,6 +107,7 @@ pub async fn import_profile(url: std::string::String, option: Option<PrfOption>)
 /// 调整profile的顺序
 #[tauri::command]
 pub async fn reorder_profile(active_id: String, over_id: String) -> CmdResult {
+    let _transaction = CoreManager::global().begin_config_transaction().await;
     match profiles_reorder_safe(&active_id, &over_id).await {
         Ok(_) => {
             logging!(info, Type::Cmd, "重新排序配置文件");
@@ -123,6 +124,7 @@ pub async fn reorder_profile(active_id: String, over_id: String) -> CmdResult {
 /// 创建一个新的配置文件
 #[tauri::command]
 pub async fn create_profile(item: PrfItem, file_data: Option<String>) -> CmdResult {
+    let _transaction = CoreManager::global().begin_config_transaction().await;
     match profiles_append_item_with_filedata_safe(&item, file_data).await {
         Ok(_) => {
             profiles_save_file_safe().await.stringify_err()?;
@@ -156,6 +158,8 @@ pub async fn update_profile(index: String, option: Option<PrfOption>) -> CmdResu
 /// 删除配置文件
 #[tauri::command]
 pub async fn delete_profile(index: String) -> CmdResult {
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
     // 使用Send-safe helper函数
     let should_update = profiles_delete_item_safe(&index).await.stringify_err()?;
     profiles_save_file_safe().await.stringify_err()?;
@@ -167,7 +171,7 @@ pub async fn delete_profile(index: String) -> CmdResult {
         logging!(warn, Type::Cmd, "Warning: 异步更新托盘菜单失败: {e}");
     }
     if should_update {
-        match CoreManager::global().update_config_forced().await {
+        match manager.update_config_with_force_in_transaction(true).await {
             Ok(outcome) if outcome.is_valid() => {
                 handle::Handle::refresh_clash();
                 // 发送配置变更通知
@@ -191,6 +195,7 @@ pub async fn delete_profile(index: String) -> CmdResult {
 
 /// 执行配置更新并处理结果
 async fn restore_previous_profile(prev_profile: &String) -> CmdResult<()> {
+    // Called only while patch_profiles_config holds config_transaction_lock.
     logging!(info, Type::Cmd, "尝试恢复到之前的配置: {}", prev_profile);
     let restore_profiles = IProfiles {
         current: Some(prev_profile.to_owned()),
@@ -200,11 +205,9 @@ async fn restore_previous_profile(prev_profile: &String) -> CmdResult<()> {
         .await
         .edit_draft(|d| d.patch_config(&restore_profiles));
     Config::profiles().await.apply();
-    crate::process::AsyncHandler::spawn(|| async move {
-        if let Err(e) = profiles_save_file_safe().await {
-            logging!(warn, Type::Cmd, "Warning: 异步保存恢复配置文件失败: {e}");
-        }
-    });
+    if let Err(e) = profiles_save_file_safe().await {
+        logging!(warn, Type::Cmd, "Warning: 保存恢复配置文件失败: {e}");
+    }
     logging!(info, Type::Cmd, "成功恢复到之前的配置");
     Ok(())
 }
@@ -276,29 +279,21 @@ async fn handle_update_error<E: std::fmt::Display>(
     Ok(ValidationOutcome::invalid_from_message(message))
 }
 
-async fn handle_timeout(current_profile: Option<&String>) -> CmdResult<ValidationOutcome> {
-    let timeout_msg: String = "配置更新超时(30秒)，可能是配置验证或核心通信阻塞".into();
-    logging!(error, Type::Cmd, "{}", timeout_msg);
-    discard_and_restore(current_profile).await?;
-    handle::Handle::notice_message("config_validate::timeout", timeout_msg.clone());
-    Ok(ValidationOutcome::invalid_from_message(timeout_msg))
-}
-
 async fn perform_config_update(
+    manager: &CoreManager,
     current_value: Option<&String>,
     current_profile: Option<&String>,
 ) -> CmdResult<ValidationOutcome> {
-    defer! {
-        CURRENT_SWITCHING_PROFILE.store(false, Ordering::Release);
-    }
-    let update_result =
-        tokio::time::timeout(Duration::from_secs(30), CoreManager::global().update_config_forced()).await;
+    // Do not cancel this future after it begins: reload/restart and persistent
+    // service synchronization are externally visible mutations.  Their own
+    // IPC/validation layers are bounded and the transaction must run through
+    // either commit or rollback before releasing the config gate.
+    let update_result = manager.update_config_with_force_in_transaction(true).await;
 
     match update_result {
-        Ok(Ok(outcome)) if outcome.is_valid() => handle_success(current_value).await,
-        Ok(Ok(outcome)) => handle_validation_failure(outcome, current_profile).await,
-        Ok(Err(e)) => handle_update_error(e, current_profile).await,
-        Err(_) => handle_timeout(current_profile).await,
+        Ok(outcome) if outcome.is_valid() => handle_success(current_value).await,
+        Ok(outcome) => handle_validation_failure(outcome, current_profile).await,
+        Err(e) => handle_update_error(e, current_profile).await,
     }
 }
 
@@ -312,7 +307,12 @@ pub async fn patch_profiles_config(profiles: IProfiles) -> CmdResult<ValidationO
         logging!(info, Type::Cmd, "当前正在切换配置，放弃请求");
         return Ok(ValidationOutcome::Busy);
     }
+    defer! {
+        CURRENT_SWITCHING_PROFILE.store(false, Ordering::Release);
+    }
 
+    let manager = CoreManager::global();
+    let _transaction = manager.begin_config_transaction().await;
     let target_profile = profiles.current.as_ref();
 
     logging!(info, Type::Cmd, "开始修改配置文件，目标profile: {:?}", target_profile);
@@ -323,7 +323,7 @@ pub async fn patch_profiles_config(profiles: IProfiles) -> CmdResult<ValidationO
 
     Config::profiles().await.edit_draft(|d| d.patch_config(&profiles));
 
-    perform_config_update(target_profile, previous_profile.as_ref()).await
+    perform_config_update(manager, target_profile, previous_profile.as_ref()).await
 }
 
 /// 根据profile name修改profiles
@@ -341,6 +341,7 @@ pub async fn patch_profiles_config_by_profile_index(profile_index: String) -> Cm
 /// 修改某个profile item的
 #[tauri::command]
 pub async fn patch_profile(index: String, profile: PrfItem) -> CmdResult {
+    let _transaction = CoreManager::global().begin_config_transaction().await;
     // 保存修改前检查是否有更新 update_interval
     let profiles = Config::profiles().await;
     let should_refresh_timer = if let Ok(old_profile) = profiles.latest_arc().get_item(&index)

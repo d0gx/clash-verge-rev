@@ -25,6 +25,7 @@ import { useVerge } from '@/hooks/use-verge'
 import {
   enhanceProfiles,
   listWindowsIcsConnections,
+  patchWindowsTunAndIcsConfig,
   repairWindowsIcs,
 } from '@/services/cmds'
 import { showNotice } from '@/services/notice-service'
@@ -45,7 +46,7 @@ export function TunViewer({ ref }: { ref?: Ref<DialogRef> }) {
   const { t } = useTranslation()
 
   const { clash, mutateClash, patchClash } = useClash()
-  const { verge, patchVerge } = useVerge()
+  const { verge, mutateVerge } = useVerge()
 
   const [open, setOpen] = useState(false)
   const [icsConnections, setIcsConnections] = useState<WindowsIcsConnection[]>(
@@ -198,7 +199,16 @@ export function TunViewer({ ref }: { ref?: Ref<DialogRef> }) {
         'strict-route': values.strictRoute,
         mtu: values.mtu ?? 1500,
       }
-      await patchClash({ tun })
+      if (OS === 'windows') {
+        await patchWindowsTunAndIcsConfig(tun, {
+          enable_windows_ics_recovery: icsAutoRecovery,
+          windows_ics_private_adapter_guid: icsPrivateGuid,
+          windows_ics_private_adapter_name: icsPrivateName,
+        })
+        mutateVerge()
+      } else {
+        await patchClash({ tun })
+      }
       await mutateClash(
         (old) => ({
           ...old!,
@@ -206,13 +216,6 @@ export function TunViewer({ ref }: { ref?: Ref<DialogRef> }) {
         }),
         false,
       )
-      if (OS === 'windows') {
-        await patchVerge({
-          enable_windows_ics_recovery: icsAutoRecovery,
-          windows_ics_private_adapter_guid: icsPrivateGuid,
-          windows_ics_private_adapter_name: icsPrivateName,
-        })
-      }
       setOpen(false)
       showNotice.success('settings.modals.tun.messages.applied')
       void enhanceProfiles().catch((err: any) => {

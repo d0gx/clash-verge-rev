@@ -1,5 +1,5 @@
 use crate::constants::files::DNS_CONFIG;
-use crate::{config::Config, process::AsyncHandler, utils::dirs};
+use crate::{config::Config, core::CoreManager, process::AsyncHandler, utils::dirs};
 use anyhow::Error;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use backon::{ConstantBuilder, Retryable as _};
@@ -270,6 +270,13 @@ fn parse_webdav_list(xml: &str) -> Result<Vec<ListEntity>, reqwest_dav::Error> {
 }
 
 pub async fn create_backup() -> Result<(String, PathBuf), Error> {
+    // A backup spans several independently persisted files. Keep the same
+    // transaction gate used by every config/profile writer until all inputs
+    // have been copied into the archive, otherwise a concurrent update could
+    // produce a torn snapshot (for example, new profile content paired with
+    // an older profiles.yaml index).
+    let _transaction = CoreManager::global().begin_config_transaction().await;
+
     let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let zip_file_name: String = format!("{OS}-backup-{now}.zip").into();
     let zip_path = temp_dir().join(zip_file_name.as_str());

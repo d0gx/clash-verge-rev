@@ -3,7 +3,7 @@ use super::{
     prfitem::{PrfItem, PrfSelected},
 };
 use crate::{
-    core::{handle, tray::Tray},
+    core::{CoreManager, handle, tray::Tray},
     utils::{
         dirs::{self, PathBufExec as _},
         help,
@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path},
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -42,6 +42,150 @@ static REGEX_PROFILE_FILE: LazyLock<regex::Regex> =
 // activate selected nodes task handle
 static ACTIVATE_SELECTED_TASK: LazyLock<Mutex<Option<JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(None));
 static ACTIVATE_SELECTED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// An allocation identity is the revision. Tokens retain their old allocation,
+/// so `Arc::ptr_eq` cannot suffer a counter-wrap or value-ABA collision.
+#[derive(Debug)]
+struct ProfileRevisionMarker;
+
+#[derive(Clone)]
+pub(crate) struct ProfileRevisionToken {
+    uid_revision: Arc<ProfileRevisionMarker>,
+    bulk_epoch: Arc<ProfileRevisionMarker>,
+}
+
+struct ProfileRevisionState {
+    revisions: HashMap<String, Arc<ProfileRevisionMarker>>,
+    gates: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    bulk_epoch: Arc<ProfileRevisionMarker>,
+}
+
+impl Default for ProfileRevisionState {
+    fn default() -> Self {
+        Self {
+            revisions: HashMap::new(),
+            gates: HashMap::new(),
+            bulk_epoch: Arc::new(ProfileRevisionMarker),
+        }
+    }
+}
+
+static PROFILE_REVISIONS: LazyLock<Mutex<ProfileRevisionState>> =
+    LazyLock::new(|| Mutex::new(ProfileRevisionState::default()));
+
+pub(crate) struct ProfileRevisionGuard {
+    uid: String,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ProfileRevisionGuard {
+    /// Linearize a new download request with every same-UID mutation. The
+    /// caller must read the URL/options while holding this guard and issue the
+    /// token immediately afterwards.
+    pub(crate) fn begin_download(&self) -> ProfileRevisionToken {
+        let mut state = PROFILE_REVISIONS.lock();
+        let revision = Arc::new(ProfileRevisionMarker);
+        state.revisions.insert(self.uid.clone(), Arc::clone(&revision));
+        ProfileRevisionToken {
+            uid_revision: revision,
+            bulk_epoch: Arc::clone(&state.bulk_epoch),
+        }
+    }
+
+    fn is_current(&self, token: &ProfileRevisionToken) -> bool {
+        let state = PROFILE_REVISIONS.lock();
+        state
+            .revisions
+            .get(&self.uid)
+            .is_some_and(|revision| Arc::ptr_eq(revision, &token.uid_revision))
+            && Arc::ptr_eq(&state.bulk_epoch, &token.bulk_epoch)
+    }
+
+    fn invalidate(&self) {
+        PROFILE_REVISIONS
+            .lock()
+            .revisions
+            .insert(self.uid.clone(), Arc::new(ProfileRevisionMarker));
+    }
+}
+
+pub(crate) struct ProfileDownloadCommitGuard {
+    revision: ProfileRevisionGuard,
+    token: ProfileRevisionToken,
+}
+
+pub(crate) struct ProfileBulkMutationGuard {
+    _uid_guards: Vec<ProfileRevisionGuard>,
+}
+
+impl Drop for ProfileBulkMutationGuard {
+    fn drop(&mut self) {
+        // A second epoch closes failures and the window in which a download
+        // began while extraction/reload was in progress.
+        PROFILE_REVISIONS.lock().bulk_epoch = Arc::new(ProfileRevisionMarker);
+    }
+}
+
+fn profile_revision_gate(uid: &String) -> Arc<tokio::sync::Mutex<()>> {
+    let mut state = PROFILE_REVISIONS.lock();
+    Arc::clone(
+        state
+            .gates
+            .entry(uid.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+pub(crate) async fn lock_profile_revision(uid: &String) -> ProfileRevisionGuard {
+    let gate = profile_revision_gate(uid);
+    ProfileRevisionGuard {
+        uid: uid.clone(),
+        _gate: gate.lock_owned().await,
+    }
+}
+
+pub(crate) async fn begin_profile_mutation(uid: &String) -> ProfileRevisionGuard {
+    let guard = lock_profile_revision(uid).await;
+    guard.invalidate();
+    guard
+}
+
+async fn begin_profile_mutations(mut uids: Vec<String>) -> Vec<ProfileRevisionGuard> {
+    uids.sort_unstable();
+    uids.dedup();
+
+    let mut guards = Vec::with_capacity(uids.len());
+    for uid in uids {
+        guards.push(lock_profile_revision(&uid).await);
+    }
+    for guard in &guards {
+        guard.invalidate();
+    }
+    guards
+}
+
+pub(crate) async fn acquire_profile_download_commit(
+    uid: &String,
+    token: &ProfileRevisionToken,
+) -> Option<ProfileDownloadCommitGuard> {
+    let revision = lock_profile_revision(uid).await;
+    revision.is_current(token).then(|| ProfileDownloadCommitGuard {
+        revision,
+        token: token.clone(),
+    })
+}
+
+/// Hold every currently known UID gate across an archive extraction/full
+/// reload. Downloads already in flight are invalidated by the epoch, while a
+/// request trying to snapshot an old UID waits until the replacement is fully
+/// visible. Lexical ordering prevents multi-UID lock inversion.
+pub(crate) async fn begin_profile_bulk_mutation(uids: Vec<String>) -> ProfileBulkMutationGuard {
+    let uid_guards = begin_profile_mutations(uids).await;
+    PROFILE_REVISIONS.lock().bulk_epoch = Arc::new(ProfileRevisionMarker);
+    ProfileBulkMutationGuard {
+        _uid_guards: uid_guards,
+    }
+}
 
 // The plugin already limits the request/response phase to 5 seconds. This outer timeout also covers
 // lock acquisition, connection-pool waiting, and local-socket connection establishment.
@@ -571,9 +715,20 @@ pub async fn profiles_append_item_with_filedata_safe(item: &PrfItem, file_data: 
 }
 
 pub async fn profiles_append_item_safe(item: &mut PrfItem) -> Result<()> {
+    let mut auxiliary = item.materialize_missing_auxiliary_profiles()?;
+    let mutation_uids = item
+        .uid
+        .iter()
+        .chain(auxiliary.iter().filter_map(|item| item.uid.as_ref()))
+        .cloned()
+        .collect();
+    let _revisions = begin_profile_mutations(mutation_uids).await;
     Config::profiles()
         .await
-        .with_data_modify(|mut profiles| async move {
+        .with_data_modify(move |mut profiles| async move {
+            for auxiliary_item in &mut auxiliary {
+                profiles.append_item(auxiliary_item).await?;
+            }
             profiles.append_item(item).await?;
             Ok((profiles, ()))
         })
@@ -581,6 +736,7 @@ pub async fn profiles_append_item_safe(item: &mut PrfItem) -> Result<()> {
 }
 
 pub async fn profiles_patch_item_safe(index: &String, item: &PrfItem) -> Result<()> {
+    let _revision = begin_profile_mutation(index).await;
     Config::profiles()
         .await
         .with_data_modify(|mut profiles| async move {
@@ -591,6 +747,26 @@ pub async fn profiles_patch_item_safe(index: &String, item: &PrfItem) -> Result<
 }
 
 pub async fn profiles_delete_item_safe(index: &String) -> Result<bool> {
+    let mut mutation_uids = vec![index.clone()];
+    {
+        let profiles = Config::profiles().await.latest_arc();
+        if let Ok(item) = profiles.get_item(index)
+            && let Some(option) = item.option.as_ref()
+        {
+            mutation_uids.extend(
+                [
+                    option.merge.clone(),
+                    option.script.clone(),
+                    option.rules.clone(),
+                    option.proxies.clone(),
+                    option.groups.clone(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    }
+    let _revisions = begin_profile_mutations(mutation_uids).await;
     Config::profiles()
         .await
         .with_data_modify(|mut profiles| async move {
@@ -601,6 +777,7 @@ pub async fn profiles_delete_item_safe(index: &String) -> Result<bool> {
 }
 
 pub async fn profiles_reorder_safe(active_id: &String, over_id: &String) -> Result<()> {
+    let _revisions = begin_profile_mutations(vec![active_id.clone(), over_id.clone()]).await;
     Config::profiles()
         .await
         .with_data_modify(|mut profiles| async move {
@@ -621,9 +798,34 @@ pub async fn profiles_save_file_safe() -> Result<()> {
 }
 
 pub async fn profiles_draft_update_item_safe(index: &String, item: &mut PrfItem) -> Result<()> {
+    let _revision = begin_profile_mutation(index).await;
+    profiles_draft_update_item_unlocked(index, item).await
+}
+
+/// Commit one downloaded item using the same per-UID gate that admitted the
+/// request. The token is consumed before file I/O, so an error cannot leave a
+/// replayable stale download behind.
+pub(crate) async fn profiles_draft_update_item_if_current_safe(
+    index: &String,
+    item: &mut PrfItem,
+    commit: &ProfileDownloadCommitGuard,
+) -> Result<bool> {
+    if commit.revision.uid != *index || !commit.revision.is_current(&commit.token) {
+        return Ok(false);
+    }
+    commit.revision.invalidate();
+    profiles_draft_update_item_unlocked(index, item).await?;
+    Ok(true)
+}
+
+async fn profiles_draft_update_item_unlocked(index: &String, item: &mut PrfItem) -> Result<()> {
+    let mut auxiliary = item.materialize_missing_auxiliary_profiles()?;
     Config::profiles()
         .await
-        .with_data_modify(|mut profiles| async move {
+        .with_data_modify(move |mut profiles| async move {
+            for auxiliary_item in &mut auxiliary {
+                profiles.append_item(auxiliary_item).await?;
+            }
             profiles.update_item(index, item).await?;
             Ok((profiles, ()))
         })
@@ -859,6 +1061,12 @@ async fn persist_reconciled_selected(
     if !is_activation_current(generation) {
         return Ok(());
     }
+
+    let _transaction = CoreManager::global().begin_config_transaction().await;
+    if !is_activation_current(generation) {
+        return Ok(());
+    }
+    let _revision = begin_profile_mutation(profile_uid).await;
 
     let profiles = Config::profiles().await;
     let profile_uid = profile_uid.clone();
